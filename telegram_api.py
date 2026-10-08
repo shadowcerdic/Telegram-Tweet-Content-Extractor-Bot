@@ -1,327 +1,283 @@
 from __future__ import annotations
 
+import json
+import logging
+import mimetypes
+import os
+import time
 from typing import Any
 
 import requests
-import json
-import os
 
-from constants import LONG_POLL_TIMEOUT, REQUEST_TIMEOUT, TELEGRAM_API_BASE
+import constants
+from constants import (
+    CAPTION_LIMIT,
+    LONG_POLL_TIMEOUT,
+    MEDIA_GROUP_MAX,
+    REQUEST_TIMEOUT,
+    TELEGRAM_API_ROOT,
+    UPLOAD_TIMEOUT,
+)
+from models import MediaItem
+
+log = logging.getLogger(__name__)
+
+_session = requests.Session()
+
+# Don't sleep longer than this when Telegram asks us to back off (429).
+_MAX_RETRY_AFTER = 30
 
 
-def get_updates(offset: int | None = None) -> list[dict[str, Any]]:
-    params: dict[str, Any] = {
-        "timeout": LONG_POLL_TIMEOUT,
-    }
+class TelegramError(Exception):
+    """A failed Bot API call. Never contains the bot token."""
 
-    if offset is not None:
-        params["offset"] = offset
+    def __init__(
+        self,
+        method: str,
+        description: str,
+        error_code: int | None = None,
+    ) -> None:
+        super().__init__(f"{method}: {description}")
+        self.method = method
+        self.description = description
+        self.error_code = error_code
 
-    response = requests.get(
-        f"{TELEGRAM_API_BASE}/getUpdates",
-        params=params,
+
+# ---------------------------------------------------------------------------
+# Low-level helper
+# ---------------------------------------------------------------------------
+
+
+def _api_url(method: str) -> str:
+    return f"{TELEGRAM_API_ROOT}/bot{constants.BOT_TOKEN}/{method}"
+
+
+def _form_value(value: Any) -> Any:
+    """Encode a value for a multipart/form-data request."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return value
+
+
+def _rewind(files: dict[str, Any] | None) -> None:
+    for value in (files or {}).values():
+        handle = value[1] if isinstance(value, tuple) else value
+        handle.seek(0)
+
+
+def _call(
+    method: str,
+    data: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
+    timeout: float = REQUEST_TIMEOUT,
+    retries: int = 1,
+) -> Any:
+    """POST to the Bot API and return ``result``.
+
+    * Raises ``TelegramError`` with Telegram's own error description (the old
+      ``raise_for_status`` only said "400 Bad Request").
+    * Network errors are re-raised *without* the request URL, because the URL
+      contains the bot token.
+    * A 429 (flood control) is retried once after the requested delay.
+    """
+    data = {k: v for k, v in (data or {}).items() if v is not None}
+
+    for attempt in range(retries + 1):
+        try:
+            if files:
+                _rewind(files)
+                response = _session.post(
+                    _api_url(method),
+                    data={k: _form_value(v) for k, v in data.items()},
+                    files=files,
+                    timeout=timeout,
+                )
+            else:
+                response = _session.post(_api_url(method), json=data, timeout=timeout)
+        except requests.RequestException as exc:
+            raise TelegramError(method, f"network error ({type(exc).__name__})") from None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        if payload.get("ok"):
+            return payload.get("result")
+
+        description = payload.get("description") or f"HTTP {response.status_code}"
+        code = payload.get("error_code") or response.status_code
+        retry_after = (payload.get("parameters") or {}).get("retry_after")
+
+        if code == 429 and retry_after and attempt < retries and retry_after <= _MAX_RETRY_AFTER:
+            log.warning("%s rate limited, retrying in %ss", method, retry_after)
+            time.sleep(retry_after + 1)
+            continue
+
+        raise TelegramError(method, description, code)
+
+    raise TelegramError(method, "unreachable")  # pragma: no cover
+
+
+def _target(
+    chat_id: int,
+    reply_to_message_id: int | None,
+    message_thread_id: int | None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {"chat_id": chat_id}
+    if reply_to_message_id is not None:
+        # allow_sending_without_reply: don't fail if the original was deleted.
+        data["reply_parameters"] = {
+            "message_id": reply_to_message_id,
+            "allow_sending_without_reply": True,
+        }
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def get_me() -> dict[str, Any]:
+    return _call("getMe") or {}
+
+
+def get_updates(offset: int | None = None, allow_edited: bool = False) -> list[dict[str, Any]]:
+    allowed = ["message", "edited_message"] if allow_edited else ["message"]
+    result = _call(
+        "getUpdates",
+        {"timeout": LONG_POLL_TIMEOUT, "offset": offset, "allowed_updates": allowed},
         timeout=LONG_POLL_TIMEOUT + 5,
     )
-    response.raise_for_status()
-
-    data = response.json()
-    if not data.get("ok"):
-        return []
-
-    return data.get("result", [])
+    return result or []
 
 
 def send_message(
     chat_id: int,
     text: str,
     reply_to_message_id: int | None = None,
-    disable_web_page_preview: bool = True,
-) -> dict:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/sendMessage",
-        data=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def get_me() -> dict[str, Any]:
-    response = requests.get(
-        f"{TELEGRAM_API_BASE}/getMe",
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"getMe failed: {data}")
-
-    return data.get("result", {})
-
-
-def send_photo(
-    chat_id: int,
-    photo_url: str,
-    caption: str | None = None,
-    reply_to_message_id: int | None = None,
-) -> None:
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "photo": photo_url,
-    }
-
-    if not photo_url:
-        print("Skipping: Photo URL is empty")
-        return
-
-    if caption:
-        payload["caption"] = caption
-
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/sendPhoto",
-        data=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-
-
-def send_video(
-    chat_id: int,
-    video_url: str,
-    caption: str | None = None,
-    reply_to_message_id: int | None = None,
-) -> None:
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "video": video_url,
-    }
-
-    if not video_url:
-        print("Skipping: Video URL is empty")
-        return
-
-    if caption:
-        payload["caption"] = caption
-
-    if reply_to_message_id is not None:
-        payload["reply_to_message_id"] = reply_to_message_id
-
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/sendVideo",
-        data=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-
-
-def send_photo_file(
-    chat_id: int,
-    file_path: str,
-    reply_to_message_id: int | None = None,
-    caption: str | None = None,
-) -> None:
-    data = {"chat_id": chat_id}
-    if reply_to_message_id is not None:
-        data["reply_to_message_id"] = reply_to_message_id
-    if caption:
-        data["caption"] = caption[:1024]
-
-    with open(file_path, "rb") as photo_file:
-        response = requests.post(
-            f"{TELEGRAM_API_BASE}/sendPhoto",
-            data=data,
-            files={"photo": photo_file},
-            timeout=REQUEST_TIMEOUT,
-        )
-    response.raise_for_status()
-
-
-def send_video_file(
-    chat_id: int,
-    file_path: str,
-    reply_to_message_id: int | None = None,
-    caption: str | None = None,
-) -> None:
-    data = {"chat_id": chat_id}
-    if reply_to_message_id is not None:
-        data["reply_to_message_id"] = reply_to_message_id
-    if caption:
-        data["caption"] = caption[:1024]
-
-    with open(file_path, "rb") as video_file:
-        response = requests.post(
-            f"{TELEGRAM_API_BASE}/sendVideo",
-            data=data,
-            files={"video": video_file},
-            timeout=REQUEST_TIMEOUT,
-        )
-    response.raise_for_status()
-
-
-def send_media_group_files(
-    chat_id: int,
-    media_items: list[tuple[str, str]],
-    caption: str | None = None,
-    reply_to_message_id: int | None = None,
-) -> None:
-    if len(media_items) < 2:
-        raise ValueError("send_media_group_files requires at least 2 media items")
-
-    media_payload: list[dict[str, Any]] = []
-    files: dict[str, Any] = {}
-    opened_files = []
-
-    try:
-        for index, (media_type, file_path) in enumerate(media_items):
-            attach_name = f"file{index}"
-            file_obj = open(file_path, "rb")
-            opened_files.append(file_obj)
-
-            if media_type == "photo":
-                files[attach_name] = (
-                    os.path.basename(file_path),
-                    file_obj,
-                    "image/jpeg",
-                )
-                item = {
-                    "type": "photo",
-                    "media": f"attach://{attach_name}",
-                }
-            elif media_type == "video":
-                files[attach_name] = (
-                    os.path.basename(file_path),
-                    file_obj,
-                    "video/mp4",
-                )
-                item = {
-                    "type": "video",
-                    "media": f"attach://{attach_name}",
-                    "supports_streaming": True,
-                }
-            else:
-                raise ValueError(f"Unsupported media type: {media_type}")
-
-            if index == 0 and caption:
-                item["caption"] = caption[:1024]
-
-            media_payload.append(item)
-
-        data: dict[str, Any] = {
-            "chat_id": chat_id,
-            "media": json.dumps(media_payload),
-        }
-
-        if reply_to_message_id is not None:
-            data["reply_to_message_id"] = reply_to_message_id
-
-        response = requests.post(
-            f"{TELEGRAM_API_BASE}/sendMediaGroup",
-            data=data,
-            files=files,
-            timeout=REQUEST_TIMEOUT * 3,
-        )
-        response.raise_for_status()
-
-    finally:
-        for file_obj in opened_files:
-            try:
-                file_obj.close()
-            except Exception:
-                pass
+    message_thread_id: int | None = None,
+) -> dict[str, Any]:
+    data = _target(chat_id, reply_to_message_id, message_thread_id)
+    data["text"] = text
+    data["link_preview_options"] = {"is_disabled": True}
+    return _call("sendMessage", data)
 
 
 def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/editMessageText",
-        data={
+    _call(
+        "editMessageText",
+        {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
+            "link_preview_options": {"is_disabled": True},
         },
-        timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
 
 
 def delete_message(chat_id: int, message_id: int) -> None:
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/deleteMessage",
-        data={
-            "chat_id": chat_id,
-            "message_id": message_id,
-        },
-        timeout=REQUEST_TIMEOUT,
+    _call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+def send_chat_action(chat_id: int, action: str, message_thread_id: int | None = None) -> None:
+    _call(
+        "sendChatAction",
+        {"chat_id": chat_id, "action": action, "message_thread_id": message_thread_id},
     )
-    response.raise_for_status()
 
 
-def send_chat_action(chat_id: int, action: str) -> None:
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/sendChatAction",
-        data={
-            "chat_id": chat_id,
-            "action": action,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+def _guess_mime(path: str, kind: str) -> str:
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or ("image/jpeg" if kind == "photo" else "video/mp4")
 
 
-def send_media_group_urls(
+def send_media(
     chat_id: int,
-    media_items: list[tuple[str, str]],
+    item: MediaItem,
     caption: str | None = None,
     reply_to_message_id: int | None = None,
-) -> None:
-    if len(media_items) < 2:
-        raise ValueError("send_media_group_urls requires at least 2 media items")
+    message_thread_id: int | None = None,
+) -> dict[str, Any]:
+    """Send one photo/video, from a URL or a local file."""
+    if item.kind not in {"photo", "video"}:
+        raise ValueError(f"Unsupported media type: {item.kind}")
+    if not item.source:
+        raise ValueError("Media source is empty")
 
-    media_payload: list[dict[str, Any]] = []
+    method, field = ("sendPhoto", "photo") if item.kind == "photo" else ("sendVideo", "video")
 
-    for index, (media_type, media_url) in enumerate(media_items):
-        if media_type == "photo":
-            item: dict[str, Any] = {
-                "type": "photo",
-                "media": media_url,
-            }
-        elif media_type == "video":
-            item = {
-                "type": "video",
-                "media": media_url,
-                "supports_streaming": True,
-            }
-        else:
-            raise ValueError(f"Unsupported media type: {media_type}")
+    data = _target(chat_id, reply_to_message_id, message_thread_id)
+    if caption:
+        data["caption"] = caption[:CAPTION_LIMIT]
+    if item.kind == "video":
+        data["supports_streaming"] = True
 
-        if index == 0 and caption:
-            item["caption"] = caption[:1024]
+    if item.is_url:
+        data[field] = item.source
+        return _call(method, data)
 
-        media_payload.append(item)
+    with open(item.source, "rb") as handle:
+        files = {field: (os.path.basename(item.source), handle, _guess_mime(item.source, item.kind))}
+        return _call(method, data, files=files, timeout=UPLOAD_TIMEOUT)
 
-    data: dict[str, Any] = {
-        "chat_id": chat_id,
-        "media": json.dumps(media_payload),
-    }
 
-    if reply_to_message_id is not None:
-        data["reply_to_message_id"] = reply_to_message_id
+def send_media_group(
+    chat_id: int,
+    items: list[MediaItem],
+    caption: str | None = None,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Send an album of 2-10 items. URL and local-file items can be mixed."""
+    if not 2 <= len(items) <= MEDIA_GROUP_MAX:
+        raise ValueError(f"A media group needs 2-{MEDIA_GROUP_MAX} items, got {len(items)}")
 
-    response = requests.post(
-        f"{TELEGRAM_API_BASE}/sendMediaGroup",
-        data=data,
-        timeout=REQUEST_TIMEOUT * 3,
-    )
-    response.raise_for_status()
+    media: list[dict[str, Any]] = []
+    files: dict[str, Any] = {}
+    handles = []
+
+    try:
+        for index, item in enumerate(items):
+            if item.kind not in {"photo", "video"}:
+                raise ValueError(f"Unsupported media type: {item.kind}")
+
+            entry: dict[str, Any] = {"type": item.kind}
+            if item.is_url:
+                entry["media"] = item.source
+            else:
+                attach_name = f"file{index}"
+                handle = open(item.source, "rb")
+                handles.append(handle)
+                files[attach_name] = (
+                    os.path.basename(item.source),
+                    handle,
+                    _guess_mime(item.source, item.kind),
+                )
+                entry["media"] = f"attach://{attach_name}"
+
+            if item.kind == "video":
+                entry["supports_streaming"] = True
+            if index == 0 and caption:
+                entry["caption"] = caption[:CAPTION_LIMIT]
+            media.append(entry)
+
+        data = _target(chat_id, reply_to_message_id, message_thread_id)
+        data["media"] = media
+        return _call(
+            "sendMediaGroup",
+            data,
+            files=files or None,
+            timeout=UPLOAD_TIMEOUT if files else REQUEST_TIMEOUT * 3,
+        )
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass

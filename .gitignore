@@ -1,4 +1,15 @@
+# Secrets / local state
 .env
-env/
-__pycache__
 offset.txt
+offset.txt.tmp
+*.session
+session-*
+
+# Runtime
+temp_instagram/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
