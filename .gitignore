@@ -1,0 +1,18 @@
+# Secrets / local state
+.env
+offset.txt
+offset.txt.tmp
+*.session
+session-*
+
+# Runtime
+temp_instagram/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# deploy backups
+*.bak*
