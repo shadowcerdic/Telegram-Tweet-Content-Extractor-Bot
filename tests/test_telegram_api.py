@@ -72,7 +72,7 @@ class CallTests(unittest.TestCase):
         with mock.patch.object(telegram_api._session, "post", return_value=fake_response({"ok": True, "result": []})) as post:
             telegram_api.get_updates(None)
         self.assertNotIn("offset", post.call_args.kwargs["json"])
-        self.assertEqual(post.call_args.kwargs["json"]["allowed_updates"], ["message"])
+        self.assertEqual(post.call_args.kwargs["json"]["allowed_updates"], ["message", "callback_query"])
 
 
 class MediaTests(unittest.TestCase):

@@ -27,6 +27,7 @@ from helpers import (
     chunk_text,
     extract_instagram_shortcodes,
     extract_tweet_ids,
+    extract_youtube_ids,
     load_last_update_id,
     save_last_update_id,
 )
@@ -34,16 +35,24 @@ from instagram_client import MediaFetchError, downloaded_instagram_media, purge_
 from models import MediaItem
 from telegram_api import (
     TelegramError,
+    answer_callback_query,
     delete_message,
     edit_message_text,
     get_me,
     get_updates,
+    send_audio,
     send_chat_action,
     send_media,
     send_media_group,
     send_message,
 )
 from x_client import get_tweet_payload
+from youtube_client import (
+    YoutubeError,
+    YoutubeOversizedError,
+    download_youtube_media,
+    get_video_info,
+)
 
 log = logging.getLogger("bot")
 
@@ -273,6 +282,102 @@ def handle_tweet(ctx: Ctx, tweet_id: str) -> None:
         status.error("Failed to process X link.")
 
 
+def handle_youtube_prompt(ctx: Ctx, video_id: str) -> None:
+    """Prompt the user with format choices when a YouTube link is detected."""
+    ctx.action("typing")
+    info = get_video_info(video_id)
+    title = info.title if info else "YouTube Video"
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🎬 ویدیو باکیفیت (1080p/720p)", "callback_data": f"yt:{video_id}:high"},
+            ],
+            [
+                {"text": "📱 ویدیو کم‌حجم (480p/360p)", "callback_data": f"yt:{video_id}:low"},
+            ],
+            [
+                {"text": "🎵 فقط صوت (MP3/M4A)", "callback_data": f"yt:{video_id}:audio"},
+            ],
+            [
+                {"text": "❌ انصراف", "callback_data": f"yt:{video_id}:cancel"},
+            ],
+        ]
+    }
+    text = (
+        f"📹 <b>{title}</b>\n\n"
+        "لطفاً کیفیت یا فرمت مورد نظر برای دانلود را انتخاب کنید:"
+    )
+    send_message(
+        ctx.chat_id,
+        text,
+        reply_to_message_id=ctx.message_id,
+        message_thread_id=ctx.thread_id,
+        reply_markup=keyboard,
+    )
+
+
+def handle_youtube_callback(callback_query: dict[str, Any]) -> None:
+    cq_id = callback_query["id"]
+    data = callback_query.get("data") or ""
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    thread_id = message.get("message_thread_id") if message.get("is_topic_message") else None
+
+    if not isinstance(chat_id, int) or not message_id:
+        answer_callback_query(cq_id)
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "yt":
+        answer_callback_query(cq_id)
+        return
+
+    _, video_id, fmt_key = parts
+
+    if fmt_key == "cancel":
+        answer_callback_query(cq_id, "عملیات لغو شد.")
+        delete_message(chat_id, message_id)
+        return
+
+    answer_callback_query(cq_id, "در حال شروع دانلود...")
+    edit_message_text(chat_id, message_id, "⏳ در حال دانلود از یوتیوب... لطفاً شکیبا باشید.")
+
+    ctx = Ctx(chat_id=chat_id, message_id=message_id, thread_id=thread_id)
+    try:
+        if fmt_key == "audio":
+            ctx.action("upload_voice")
+        else:
+            ctx.action("upload_video")
+
+        with download_youtube_media(video_id, fmt_key) as (file_path, title, media_type):
+            edit_message_text(chat_id, message_id, "📤 در حال ارسال به تلگرام...")
+            if media_type == "audio":
+                send_audio(
+                    chat_id,
+                    file_path=file_path,
+                    title=title,
+                    caption=f"🎵 {title}",
+                    message_thread_id=thread_id,
+                )
+            else:
+                item = MediaItem(kind="video", source=file_path)
+                send_media(
+                    chat_id,
+                    item=item,
+                    caption=f"🎬 {title}",
+                    message_thread_id=thread_id,
+                )
+        delete_message(chat_id, message_id)
+    except YoutubeOversizedError as exc:
+        edit_message_text(chat_id, message_id, f"⚠️ {exc}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("YouTube download failed for %s (%s)", video_id, fmt_key)
+        edit_message_text(chat_id, message_id, f"❌ خطا در پردازش یوتیوب: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Update handling
 # ---------------------------------------------------------------------------
@@ -315,13 +420,22 @@ def process_message(message: dict[str, Any]) -> None:
 
     jobs: list[tuple[Callable[[Ctx, str], None], str]] = [
         (handle_instagram, code) for code in extract_instagram_shortcodes(text)
-    ] + [(handle_tweet, tweet_id) for tweet_id in extract_tweet_ids(text)]
+    ] + [
+        (handle_tweet, tweet_id) for tweet_id in extract_tweet_ids(text)
+    ] + [
+        (handle_youtube_prompt, yt_id) for yt_id in extract_youtube_ids(text)
+    ]
 
     for handler, link_id in jobs[:MAX_LINKS_PER_MESSAGE]:
         handler(ctx, link_id)
 
 
 def process_update(update: dict[str, Any]) -> None:
+    cq = update.get("callback_query")
+    if cq:
+        handle_youtube_callback(cq)
+        return
+
     message = update.get("message")
     if message is None and PROCESS_EDITED_MESSAGES:
         message = update.get("edited_message")

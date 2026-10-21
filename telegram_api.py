@@ -148,7 +148,11 @@ def get_me() -> dict[str, Any]:
 
 
 def get_updates(offset: int | None = None, allow_edited: bool = False) -> list[dict[str, Any]]:
-    allowed = ["message", "edited_message"] if allow_edited else ["message"]
+    allowed = (
+        ["message", "edited_message", "callback_query"]
+        if allow_edited
+        else ["message", "callback_query"]
+    )
     result = _call(
         "getUpdates",
         {"timeout": LONG_POLL_TIMEOUT, "offset": offset, "allowed_updates": allowed},
@@ -162,23 +166,44 @@ def send_message(
     text: str,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
+    reply_markup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data = _target(chat_id, reply_to_message_id, message_thread_id)
     data["text"] = text
     data["link_preview_options"] = {"is_disabled": True}
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
     return _call("sendMessage", data)
 
 
-def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
-    _call(
-        "editMessageText",
-        {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-            "link_preview_options": {"is_disabled": True},
-        },
-    )
+def edit_message_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    _call("editMessageText", data)
+
+
+def answer_callback_query(
+    callback_query_id: str,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> None:
+    data: dict[str, Any] = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = text
+    if show_alert:
+        data["show_alert"] = True
+    _call("answerCallbackQuery", data)
 
 
 def delete_message(chat_id: int, message_id: int) -> None:
@@ -195,6 +220,25 @@ def send_chat_action(chat_id: int, action: str, message_thread_id: int | None = 
 def _guess_mime(path: str, kind: str) -> str:
     guessed, _ = mimetypes.guess_type(path)
     return guessed or ("image/jpeg" if kind == "photo" else "video/mp4")
+
+
+def send_audio(
+    chat_id: int,
+    file_path: str,
+    title: str | None = None,
+    caption: str | None = None,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> dict[str, Any]:
+    data = _target(chat_id, reply_to_message_id, message_thread_id)
+    if caption:
+        data["caption"] = caption[:CAPTION_LIMIT]
+    if title:
+        data["title"] = title
+
+    with open(file_path, "rb") as handle:
+        files = {"audio": (os.path.basename(file_path), handle, "audio/mp4")}
+        return _call("sendAudio", data, files=files, timeout=UPLOAD_TIMEOUT)
 
 
 def send_media(

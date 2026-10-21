@@ -22,10 +22,22 @@ INSTAGRAM_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches youtu.be/<id>, youtube.com/watch?v=<id>, and youtube.com/shorts/<id>
+YOUTUBE_LINK_RE = re.compile(
+    r"https?://(?:www\.|m\.)?(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/))([A-Za-z0-9_-]{11})",
+    re.IGNORECASE,
+)
+
 
 def unique(items: Iterable[T]) -> list[T]:
     """De-duplicate while keeping the original order."""
     return list(dict.fromkeys(items))
+
+
+def extract_youtube_ids(text: str) -> list[str]:
+    if not text:
+        return []
+    return unique(YOUTUBE_LINK_RE.findall(text))
 
 
 def extract_instagram_shortcodes(text: str) -> list[str]:

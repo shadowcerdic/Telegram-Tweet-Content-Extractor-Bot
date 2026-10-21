@@ -4,7 +4,8 @@ A Telegram bot that extracts and translates tweet text from Twitter/X links and 
 
 ## Features
 
-- **Automatic link detection**: Twitter/X and Instagram links in messages (including links hidden behind text, and the `instagram.com/<user>/reel/<code>` share format)
+- **Automatic link detection**: Twitter/X, Instagram, and YouTube links in messages (including links hidden behind text, and share formats)
+- **YouTube support**: Prompts with an inline keyboard to choose the preferred format (high quality MP4, low quality MP4, or audio MP3/M4A), downloads strictly under Telegram's 50MB limit, sends natively, and leaves zero server residue
 - **Tweet extraction & translation**: Extracts tweet text and translates non-Persian tweets to Persian (target language configurable)
 - **X media support**: Sends tweet photos and videos
 - **Instagram support**: Downloads and sends images/videos from public posts and reels, including carousels (in the correct order)

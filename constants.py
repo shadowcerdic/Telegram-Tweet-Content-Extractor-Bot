@@ -41,6 +41,9 @@ PROCESS_EDITED_MESSAGES = _bool_env("PROCESS_EDITED_MESSAGES", False)
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "").strip()
 INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE", "").strip()
 
+# YouTube downloader proxy (Cloudflare WARP default on VPS to avoid datacenter IP bot detection)
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "socks5://127.0.0.1:40000").strip()
+
 # --- Fixed settings ------------------------------------------------------------
 TELEGRAM_API_ROOT = "https://api.telegram.org"
 OFFSET_FILE = os.getenv("OFFSET_FILE", "offset.txt")
