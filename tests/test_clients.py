@@ -245,6 +245,52 @@ class TranslationFallback(unittest.TestCase):
         self.assertEqual(get.call_count, 1)
         fb.assert_not_called()
 
+    def test_echo_translation_is_treated_as_missing(self):
+        """fx returning the source text verbatim is a failure, not a translation."""
+        tweet = _tweet(id="8", text="hello", lang="en")
+        tweet["translation"] = {"text": "hello", "source_lang": "en",
+                                "target_lang": "fa", "provider": "grok"}
+        x_client._scrub_echo(tweet, "fa")
+        self.assertIsNone(tweet["translation"])
+
+    def test_echo_is_left_alone_when_already_in_target_language(self):
+        tweet = _tweet(id="9", text="سلام", lang="fa")
+        tweet["translation"] = {"text": "سلام", "provider": "grok"}
+        x_client._scrub_echo(tweet, "fa")
+        self.assertEqual(tweet["translation"]["text"], "سلام")
+
+    def test_outer_echo_falls_through_to_the_fallback(self):
+        outer = _tweet(id="10", text="hello", lang="en",
+                       translation={"text": "hello", "provider": "grok"})
+        with mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(outer))) as get, \
+             mock.patch.object(x_client.translator, "translate", return_value="سلام") as fb:
+            result = _fetched("10", translate_to="fa")
+        self.assertEqual(get.call_count, 2)          # original + one re-fetch
+        fb.assert_called_once_with("hello", "fa")
+        self.assertEqual(result.tweet["translation"]["provider"], "google-fallback")
+
+    def test_quoted_echo_is_recovered_by_the_fallback(self):
+        """Live case: a Japanese quote came back as provider=grok repeating Japanese."""
+        ja = "君のチンチンは大きい"
+        quote = _tweet(id="2", text=ja, lang="ja",
+                       translation={"text": ja, "provider": "grok"})
+        outer = _tweet(id="1", text="", lang="fa", quote=quote)
+        refetch = _tweet(id="2", text=ja, lang="ja",
+                         translation={"text": ja, "provider": "grok"})
+        with mock.patch.object(x_client._session, "get",
+                               side_effect=[resp(200, _envelope(outer)),
+                                            resp(200, _envelope(refetch))]) as get, \
+             mock.patch.object(x_client.translator, "translate",
+                               return_value="آلت تناسلی تو بزرگ است") as fb:
+            result = _fetched("1", translate_to="fa")
+        # The nested object already carried an (echo) translation, so the quote
+        # refetch was skipped; one re-fetch + the fallback recovered it.
+        self.assertEqual(get.call_count, 2)
+        fb.assert_called_once_with(ja, "fa")
+        assert result.quote is not None
+        self.assertEqual(result.quote.tweet["translation"]["provider"], "google-fallback")
+
     def test_persian_needs_no_translation_call_at_all(self):
         with mock.patch.object(x_client._session, "get",
                                return_value=resp(200, _envelope(_tweet(text="سلام", lang="fa")))) as get, \

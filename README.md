@@ -113,7 +113,9 @@ No network, token, or `instaloader` needed.
    own link in the same message it is delivered once, not twice)
 4. Translation: FxTwitter's own translate endpoint → one re-fetch when it comes
    back empty (transient gaps) → Google's keyless web endpoint (FxTwitter fails
-   deterministically for some tweet/language pairs, e.g. `fa` on long note tweets)
+   deterministically for some tweet/language pairs, e.g. `fa` on long note tweets,
+   and for others it "translates" by repeating the source text verbatim — an echo
+   is treated as a failure, not as a translation)
 5. Sends text as the caption when it fits in 1024 characters; otherwise the text goes first as normal message(s) and the media follows. A quoted post's media goes out after the outer media, captioned with its own author
 
 ### Instagram

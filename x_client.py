@@ -217,9 +217,36 @@ def _needs_translation(tweet: dict[str, Any], translate_to: str | None) -> bool:
     return not (tweet.get("translation") or {}).get("text")
 
 
-def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None:
-    """Fill ``tweet["translation"]`` for the two known FxTwitter failure modes.
+def _scrub_echo(tweet: dict[str, Any], translate_to: str) -> None:
+    """Clear an upstream ``translation`` that is just the source text repeated.
 
+    Measured live on a quoted Japanese tweet (id 2114674323822883285, target
+    ``fa``): FxTwitter answered ``provider="grok"`` with ``translation.text``
+    byte-identical to ``tweet.text``. Presence of the field is therefore not
+    proof of a translation; left alone it satisfies every "do we have one?" check
+    while the user still sees untranslated Japanese. Clearing it here makes the
+    recovery path below treat the tweet as untranslated.
+    """
+    trans = tweet.get("translation") or {}
+    text = (trans.get("text") or "").strip()
+    if not text:
+        return
+    if (tweet.get("lang") or "").strip().lower() == translate_to:
+        return
+    if text == (tweet.get("text") or "").strip():
+        log.info(
+            "Tweet %s: fxtwitter echoed the source text instead of translating to %s",
+            tweet.get("id"),
+            translate_to,
+        )
+        tweet["translation"] = None
+
+
+def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None:
+    """Fill ``tweet["translation"]`` for the three known FxTwitter failure modes.
+
+    0. echo — ``translation.text`` equals the original (see ``_scrub_echo``), so
+       the pair silently failed even though the field is populated.
     1. transient — the translate backend sometimes answers without a
        ``translation`` field on a short tweet; one re-fetch recovers it.
     2. deterministic — specific (tweet, target-language) pairs always come back
@@ -229,10 +256,12 @@ def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None
        Long-form (note) tweets are the reliable signature, so those skip the
        pointless re-fetch and go straight to the keyless Google endpoint.
 
-    Mutates ``tweet``; never raises. When both layers come up empty the text is
-    left untranslated and helpers render it as "ترجمه در دسترس نبود" — silence
-    would look like the bot skipped the work.
+    Mutates ``tweet``; never raises. When no layer produces a real translation
+    the text stays as-is and helpers render "ترجمه در دسترس نبود" — silence would
+    look like the bot skipped the work.
     """
+    if translate_to:
+        _scrub_echo(tweet, translate_to)
     if TRANSLATE_FALLBACK == "off" or not translate_to:
         return
     if not _needs_translation(tweet, translate_to):
@@ -249,7 +278,9 @@ def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None
             again = None
         if again and (again.get("translation") or {}).get("text"):
             tweet["translation"] = again["translation"]
-            return
+            _scrub_echo(tweet, translate_to)
+            if not _needs_translation(tweet, translate_to):
+                return
 
     translated = translator.translate(tweet.get("text") or "", translate_to)
     if translated:
