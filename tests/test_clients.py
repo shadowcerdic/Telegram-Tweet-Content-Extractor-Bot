@@ -149,23 +149,28 @@ class XClientQuote(unittest.TestCase):
         refreshed = _envelope(_tweet(id="2", text="hello", lang="en",
                                      translation={"text": "سلام"}))
         with mock.patch.object(x_client._session, "get",
-                               side_effect=[resp(200, payload), resp(200, refreshed)]) as get:
+                               side_effect=[resp(200, payload), resp(200, refreshed)]) as get, \
+             mock.patch.object(x_client.translator, "translate") as fb:
             result = _fetched("1", translate_to="fa")
         quote = result.quote
         assert quote is not None
         urls = [c.args[0] for c in get.call_args_list]
         self.assertEqual(urls[1], "https://api.fxtwitter.com/i/status/2/fa")
         self.assertEqual(quote.tweet["translation"]["text"], "سلام")
+        fb.assert_not_called()  # fxtwitter answered on the retry: no third-party call
 
     def test_translation_refetch_failure_keeps_the_quote(self):
         """A dead translate call must not lose the quoted tweet or crash the handler."""
         payload = _envelope(_tweet(text="outer", quote=_tweet(id="2", text="hello", lang="en")))
         with mock.patch.object(x_client._session, "get",
-                               side_effect=[resp(200, payload), requests.RequestException("down")]):
+                               side_effect=[resp(200, payload), requests.RequestException("down")]), \
+             mock.patch.object(x_client.translator, "translate", return_value="سلام") as fb:
             result = _fetched("1", translate_to="fa")
         quote = result.quote
         assert quote is not None
-        self.assertEqual(quote.tweet["text"], "hello")  # untranslated, still delivered
+        self.assertEqual(quote.tweet["translation"]["text"], "سلام")
+        self.assertEqual(quote.tweet["translation"]["provider"], "google-fallback")
+        fb.assert_called_once_with("hello", "fa")
 
     def test_deleted_quote_becomes_a_reason_not_a_crash(self):
         payload = _envelope(_tweet(quote={"type": "tombstone", "reason": "deleted"}))
@@ -195,6 +200,69 @@ class XClientQuote(unittest.TestCase):
             result = _fetched("1")
         self.assertIsNone(result.quote)
         self.assertIsNone(result.quote_unavailable)
+
+
+class TranslationFallback(unittest.TestCase):
+    """The measured gap: fxtwitter returns nothing for certain tweet/language pairs."""
+
+    def test_note_tweet_goes_straight_to_the_fallback(self):
+        """Long-form tweets fail deterministically, so the re-fetch would be wasted."""
+        note = _tweet(id="9", text="x" * 1000, lang="en", is_note_tweet=True)
+        with mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(note))) as get, \
+             mock.patch.object(x_client.translator, "translate", return_value="متن فارسی") as fb:
+            result = _fetched("9", translate_to="fa")
+        self.assertEqual(get.call_count, 1)
+        fb.assert_called_once()
+        self.assertEqual(result.tweet["translation"]["text"], "متن فارسی")
+        self.assertEqual(result.tweet["translation"]["provider"], "google-fallback")
+
+    def test_fallback_also_covers_the_outer_tweet(self):
+        outer = _tweet(id="5", text="hello", lang="en")
+        with mock.patch.object(x_client._session, "get",
+                               side_effect=[resp(200, _envelope(outer)),
+                                            resp(200, _envelope(outer))]), \
+             mock.patch.object(x_client.translator, "translate", return_value="سلام") as fb:
+            result = _fetched("5", translate_to="fa")
+        fb.assert_called_once_with("hello", "fa")
+        self.assertEqual(result.tweet["translation"]["text"], "سلام")
+
+    def test_when_both_layers_fail_the_tweet_is_still_delivered(self):
+        outer = _tweet(id="6", text="hello", lang="en", is_note_tweet=True)
+        with mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(outer))), \
+             mock.patch.object(x_client.translator, "translate", return_value=None):
+            result = _fetched("6", translate_to="fa")
+        self.assertEqual(result.tweet["text"], "hello")
+        self.assertFalse((result.tweet.get("translation") or {}).get("text"))
+
+    def test_no_extra_call_when_a_translation_already_exists(self):
+        outer = _tweet(id="7", text="hello", lang="en", translation={"text": "سلام"})
+        with mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(outer))) as get, \
+             mock.patch.object(x_client.translator, "translate") as fb:
+            _fetched("7", translate_to="fa")
+        self.assertEqual(get.call_count, 1)
+        fb.assert_not_called()
+
+    def test_persian_needs_no_translation_call_at_all(self):
+        with mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(_tweet(text="سلام", lang="fa")))) as get, \
+             mock.patch.object(x_client.translator, "translate") as fb:
+            _fetched("8", translate_to="fa")
+        self.assertEqual(get.call_count, 1)
+        fb.assert_not_called()
+
+    def test_switch_off_makes_no_extra_requests(self):
+        outer = _tweet(id="10", text="hello", lang="en")
+        with mock.patch.object(x_client, "TRANSLATE_FALLBACK", "off"), \
+             mock.patch.object(x_client._session, "get",
+                               return_value=resp(200, _envelope(outer))) as get, \
+             mock.patch.object(x_client.translator, "translate") as fb:
+            result = _fetched("10", translate_to="fa")
+        self.assertEqual(get.call_count, 1)
+        fb.assert_not_called()
+        self.assertIsNone(result.tweet.get("translation"))
 
 
 if __name__ == "__main__":

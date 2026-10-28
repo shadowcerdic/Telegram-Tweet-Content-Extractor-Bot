@@ -7,6 +7,8 @@ A Telegram bot that extracts and translates tweet text from Twitter/X links and 
 - **Automatic link detection**: Twitter/X, Instagram, and YouTube links in messages (including links hidden behind text, and share formats)
 - **YouTube support**: Prompts with an inline keyboard to choose the preferred format (high quality MP4, low quality MP4, or audio MP3/M4A), downloads strictly under Telegram's 50MB limit, sends natively, and leaves zero server residue
 - **Tweet extraction & translation**: Extracts tweet text and translates non-Persian tweets to Persian (target language configurable)
+- **Quote tweets**: A link to a quote post delivers both tweets — the outer text with the quoted post rendered under it as a Twitter-style card, then the outer media, then the quoted media captioned with its own author
+- **Translation fallback**: FxTwitter's translate backend drops certain (tweet, language) pairs outright; the bot retries once and then falls back to Google's keyless web endpoint, and announces "ترجمه در دسترس نبود" when neither worked
 - **X media support**: Sends tweet photos and videos
 - **Instagram support**: Downloads and sends images/videos from public posts and reels, including carousels (in the correct order)
 - **Albums**: Multiple media are sent as Telegram albums; large sets are split into evenly sized albums
@@ -50,6 +52,7 @@ Copy `.env.example` to `.env` and fill it in:
 | `POLL_INTERVAL` | `1` | Seconds to wait after an empty poll |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 | `TRANSLATE_TO` | `fa` | Translation language code; empty disables translation |
+| `TRANSLATE_FALLBACK` | `google` | `google` = keyless web endpoint when FxTwitter returns no translation; `off` = never call it |
 | `PROCESS_EDITED_MESSAGES` | `0` | `1` to reply again when a message is edited |
 | `INSTAGRAM_USERNAME` | – | Username of a saved Instaloader session (see below) |
 | `INSTAGRAM_SESSION_FILE` | – | Optional path to that session file |
@@ -89,7 +92,8 @@ No network, token, or `instaloader` needed.
 | --- | --- |
 | `main.py` | Polling loop, message routing, sending logic |
 | `telegram_api.py` | Bot API wrapper (single `_call` with error handling, rate-limit retry, token-safe errors) |
-| `x_client.py` | Fetches tweets via FxTwitter |
+| `x_client.py` | Fetches tweets (and quoted tweets) via FxTwitter, translation layers |
+| `translator.py` | Keyless Google web translation used when FxTwitter returns none |
 | `instagram_client.py` | Downloads Instagram posts into a private temp dir |
 | `downloader.py` | Downloads remote media for the upload fallback |
 | `helpers.py` | Link regexes, text/album chunking, reply text, offset file |
@@ -102,7 +106,15 @@ No network, token, or `instaloader` needed.
 
 1. Detects X links, extracts the tweet ID
 2. Fetches tweet content via fxtwitter, translated if needed
-3. Sends text as the caption when it fits in 1024 characters; otherwise the text goes first as normal message(s) and the media follows
+3. If the tweet is a quote post, the nested quoted tweet is parsed with the same
+   media rules and run through the same translation layers, then rendered as a
+   card under the outer text (deleted/protected quotes are named, not dropped;
+   a quote of a quote is not expanded; if the quoted post was also pasted as its
+   own link in the same message it is delivered once, not twice)
+4. Translation: FxTwitter's own translate endpoint → one re-fetch when it comes
+   back empty (transient gaps) → Google's keyless web endpoint (FxTwitter fails
+   deterministically for some tweet/language pairs, e.g. `fa` on long note tweets)
+5. Sends text as the caption when it fits in 1024 characters; otherwise the text goes first as normal message(s) and the media follows. A quoted post's media goes out after the outer media, captioned with its own author
 
 ### Instagram
 

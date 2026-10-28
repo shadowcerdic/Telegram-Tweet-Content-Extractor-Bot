@@ -8,7 +8,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-from constants import FXTWITTER_API_BASE, MAX_UPLOAD_BYTES, REQUEST_TIMEOUT
+import translator
+from constants import (
+    FXTWITTER_API_BASE,
+    MAX_UPLOAD_BYTES,
+    REQUEST_TIMEOUT,
+    TRANSLATE_FALLBACK,
+)
 from models import MediaItem
 
 log = logging.getLogger(__name__)
@@ -200,15 +206,73 @@ def _fetch_tweet_raw(tweet_id: str, translate_to: str | None = None) -> dict[str
     return tweet if isinstance(tweet, dict) else None
 
 
+def _needs_translation(tweet: dict[str, Any], translate_to: str | None) -> bool:
+    if not translate_to:
+        return False
+    if not (tweet.get("text") or "").strip():
+        return False
+    lang = (tweet.get("lang") or "").strip().lower()
+    if lang == translate_to:
+        return False
+    return not (tweet.get("translation") or {}).get("text")
+
+
+def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None:
+    """Fill ``tweet["translation"]`` for the two known FxTwitter failure modes.
+
+    1. transient — the translate backend sometimes answers without a
+       ``translation`` field on a short tweet; one re-fetch recovers it.
+    2. deterministic — specific (tweet, target-language) pairs always come back
+       untranslated. Measured on a 1032-char note tweet: ``fa``/``de``/``hi``
+       empty on six consecutive attempts while ``ar``/``tr``/``es``/``fr``/
+       ``ja``/``pt``/``ru``/``ko``/``zh-CN`` all succeeded for the same tweet.
+       Long-form (note) tweets are the reliable signature, so those skip the
+       pointless re-fetch and go straight to the keyless Google endpoint.
+
+    Mutates ``tweet``; never raises. When both layers come up empty the text is
+    left untranslated and helpers render it as "ترجمه در دسترس نبود" — silence
+    would look like the bot skipped the work.
+    """
+    if TRANSLATE_FALLBACK == "off" or not translate_to:
+        return
+    if not _needs_translation(tweet, translate_to):
+        return
+
+    lang = (tweet.get("lang") or "").strip().lower()
+    tweet_id = str(tweet.get("id") or "")
+
+    if tweet_id and not tweet.get("is_note_tweet"):
+        try:
+            again = _fetch_tweet_raw(tweet_id, translate_to)
+        except requests.RequestException as exc:
+            log.info("translate retry for %s failed: %s", tweet_id, exc)
+            again = None
+        if again and (again.get("translation") or {}).get("text"):
+            tweet["translation"] = again["translation"]
+            return
+
+    translated = translator.translate(tweet.get("text") or "", translate_to)
+    if translated:
+        tweet["translation"] = {
+            "text": translated,
+            "source_lang": lang,
+            "source_lang_en": lang,
+            "target_lang": translate_to,
+            "provider": "google-fallback",
+        }
+        log.info("Tweet %s: translated by the fallback (fxtwitter returned none)", tweet_id)
+    else:
+        log.info("Tweet %s: no translation from fxtwitter or the fallback (lang=%r)", tweet_id, lang)
+
+
 def _parse_quote(raw: Any, translate_to: str | None) -> tuple[TweetPayload | None, str | None]:
     """Resolve ``tweet["quote"]`` into (payload, unavailable_reason).
 
     FxTwitter embeds the quoted tweet with full media (including per-variant
     bitrates, so the 50 MB picker works unchanged on it) but WITHOUT a
-    ``translation`` — the translate endpoint only translates the focal tweet. When
-    the quoted post is in another language we therefore re-fetch it by id with the
-    translation suffix. If that second call fails or comes back empty we keep the
-    nested object: an untranslated quote still beats a missing one.
+    ``translation`` — the translate endpoint only translates the focal tweet. So
+    the nested object is parsed as-is and then run through the same translation
+    layers as a top-level tweet.
 
     Depth is capped at 1: a quote inside the quoted post is not rendered.
     """
@@ -222,22 +286,8 @@ def _parse_quote(raw: Any, translate_to: str | None) -> tuple[TweetPayload | Non
     if not quote_id or not (raw.get("text") or raw.get("media")):
         return None, None
 
-    lang = (raw.get("lang") or "").strip().lower()
-    if (
-        translate_to
-        and lang
-        and lang != translate_to
-        and not (raw.get("translation") or {}).get("text")
-    ):
-        try:
-            refreshed = _fetch_tweet_raw(quote_id, translate_to)
-        except requests.RequestException as exc:
-            log.info("quote %s: translate fetch failed (%s); keeping original text", quote_id, exc)
-            refreshed = None
-        if refreshed:
-            raw = refreshed
-
     payload = _build_payload(raw)
+    _ensure_translation(payload.tweet, translate_to)
     payload.quote = None
     payload.quote_unavailable = None
     return payload, None
@@ -254,6 +304,7 @@ def get_tweet_payload(tweet_id: str, translate_to: str | None = None) -> TweetPa
         return None
 
     payload = _build_payload(tweet)
+    _ensure_translation(payload.tweet, translate_to)
 
     quote, unavailable = _parse_quote(tweet.get("quote"), translate_to)
     if quote is not None and str(quote.tweet.get("id") or "") == str(tweet_id):

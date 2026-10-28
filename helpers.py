@@ -85,7 +85,12 @@ def _tweet_body(tweet: dict[str, Any]) -> str:
         else ""
     )
 
-    if lang == TRANSLATE_TO or not translated or translated == original:
+    if not translated or translated == original:
+        # Nothing came back from the translation layers (fxtwitter drops certain
+        # tweet/language pairs outright). Name that instead of quietly posting
+        # only the source text, which reads as the bot skipping its job.
+        if TRANSLATE_TO and lang and lang != TRANSLATE_TO:
+            return f"متن اصلی (ترجمه در دسترس نبود):\n\n{original}"
         return original
 
     label = "ترجمه فارسی" if TRANSLATE_TO == "fa" else f"Translation ({TRANSLATE_TO})"

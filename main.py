@@ -263,20 +263,9 @@ def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()
             status.error("Could not fetch that tweet text.")
             return
 
-        # The translation backend occasionally fails transiently: the tweet comes
-        # back fine but without the `translation` field, and the reply silently
-        # loses its Persian part. Retry once after a short delay when that happens.
-        def _has_translation(p: Any) -> bool:
-            return bool((p.tweet.get("translation") or {}).get("text"))
-
-        if TRANSLATE_TO and not _has_translation(payload):
-            lang = (payload.tweet.get("lang") or "").strip().lower()
-            if lang and lang != TRANSLATE_TO:
-                log.info("Tweet %s: translation missing (lang=%r); retrying", tweet_id, lang)
-                time.sleep(2)
-                retry = get_tweet_payload(tweet_id, translate_to=TRANSLATE_TO or None)
-                if retry is not None and _has_translation(retry):
-                    payload = retry
+        # Translation gaps (transient AND the deterministic per-language ones) are
+        # recovered inside x_client._ensure_translation, for this tweet and for a
+        # quoted one; if it still comes back empty the card says so explicitly.
 
         quote = payload.quote
         if quote is not None and str(quote.tweet.get("id") or "") in siblings:

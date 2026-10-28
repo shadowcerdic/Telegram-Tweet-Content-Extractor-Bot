@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import helpers
 from helpers import (
@@ -110,11 +111,18 @@ class ReplyText(unittest.TestCase):
         self.assertIn("Original:\n\nHello", out)
         self.assertIn("ترجمه فارسی:\n\nسلام", out)
 
-    def test_identical_translation_collapsed(self):
+    def test_identical_translation_is_treated_as_no_translation(self):
+        """An echo ("ok" -> "ok") is not a translation; say so instead of printing it twice.
+
+        Behaviour change from 2026-10-28: this used to collapse silently to "ok",
+        which looked like the bot had skipped the work.
+        """
         out = build_reply_text(
             {"text": "ok", "lang": "en", "translation": {"text": "ok"}, "author": {}}
         )
-        self.assertEqual(out, "ok")
+        assert out is not None
+        self.assertEqual(out, "متن اصلی (ترجمه در دسترس نبود):\n\nok")
+        self.assertNotIn("Original:", out)
 
     def test_missing_author_does_not_leave_dangling_dash(self):
         self.assertEqual(build_reply_text({"text": "hi", "lang": "fa"}), "hi")
@@ -200,6 +208,29 @@ class QuoteSection(unittest.TestCase):
             "author": {"name": "N", "url": ""},
         }
         self.assertEqual(build_reply_text(en), "Original:\n\nhi\n\nترجمه فارسی:\n\nسلام\n\n— N")
+
+    def test_failed_translation_is_announced_not_silent(self):
+        """A tweet with no translation at all must say so, never look 'finished'."""
+        en = {"text": "hello there", "lang": "en", "author": {"name": "N", "url": ""}}
+        self.assertEqual(
+            build_reply_text(en), "متن اصلی (ترجمه در دسترس نبود):\n\nhello there\n\n— N"
+        )
+
+    def test_disabled_translation_is_not_announced(self):
+        """TRANSLATE_TO='' means nobody asked for a translation, so no warning."""
+        with mock.patch.object(helpers, "TRANSLATE_TO", ""):
+            self.assertEqual(build_reply_text({"text": "hello", "lang": "en"}), "hello")
+
+    def test_untranslated_source_language_is_announced(self):
+        en = {"text": "hello", "lang": "en", "translation": {"text": "hello"}}
+        self.assertEqual(build_reply_text(en), "متن اصلی (ترجمه در دسترس نبود):\n\nhello")
+
+    def test_card_marks_an_untranslatable_quote(self):
+        quote = {"id": "4", "text": "long english note", "lang": "en",
+                 "author": {"name": "Q", "screen_name": "q"}}
+        block = helpers.build_quote_section(quote)
+        self.assertIn("↩️ نقل‌قول از Q (@q):", block)
+        self.assertIn("متن اصلی (ترجمه در دسترس نبود):", block)
 
 
 if __name__ == "__main__":
