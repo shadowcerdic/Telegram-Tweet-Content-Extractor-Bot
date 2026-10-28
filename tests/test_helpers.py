@@ -141,5 +141,66 @@ class OffsetFile(unittest.TestCase):
             self.assertIsNone(load_last_update_id(path))
 
 
+class QuoteSection(unittest.TestCase):
+    """The quoted post rendered as a Twitter-style card under the outer tweet."""
+
+    FA_QUOTE = {
+        "id": "2",
+        "text": "متن نقل‌قول",
+        "lang": "fa",
+        "url": "https://x.com/q/status/2",
+        "author": {"name": "Q Name", "screen_name": "q"},
+    }
+
+    def test_no_quote_renders_nothing(self):
+        self.assertEqual(helpers.build_quote_section(None), "")
+        self.assertEqual(helpers.build_quote_section({}), "")
+        self.assertEqual(helpers.build_quote_section({"id": "2", "text": ""}), "")
+
+    def test_card_block_with_author_and_link(self):
+        block = helpers.build_quote_section(self.FA_QUOTE)
+        self.assertIn("↩️ نقل‌قول از Q Name (@q):", block)
+        self.assertIn("متن نقل‌قول", block)
+        self.assertIn("🔗 https://x.com/q/status/2", block)
+        # The outer author signature must not leak into the card.
+        self.assertNotIn("Profile:", block)
+
+    def test_card_keeps_original_and_translation(self):
+        quote = {
+            "id": "3",
+            "text": "hello there",
+            "lang": "en",
+            "translation": {"text": "سلام"},
+            "author": {"name": "E", "screen_name": "e"},
+        }
+        block = helpers.build_quote_section(quote)
+        self.assertIn("Original:\n\nhello there", block)
+        self.assertIn("ترجمه فارسی:\n\nسلام", block)
+
+    def test_unavailable_quote_is_announced_not_silent(self):
+        block = helpers.build_quote_section(None, unavailable="deleted")
+        self.assertIn("در دسترس نیست (deleted)", block)
+
+    def test_author_label_fallbacks(self):
+        self.assertEqual(helpers.quote_author_label(None), "کاربر دیگر")
+        self.assertEqual(helpers.quote_author_label({"author": {"name": "Only Name"}}), "Only Name")
+        self.assertEqual(helpers.quote_author_label({"author": {"screen_name": "only"}}), "only")
+
+    def test_build_reply_text_unchanged_for_plain_tweets(self):
+        """Regression: the fa/translation behaviour must match the pre-quote code."""
+        fa = {"text": "سلام", "lang": "fa", "author": {"name": "N", "url": "https://x.com/n"}}
+        self.assertEqual(
+            build_reply_text(fa),
+            "سلام\n\n— N\n\nProfile: https://x.com/n",
+        )
+        en = {
+            "text": "hi",
+            "lang": "en",
+            "translation": {"text": "سلام"},
+            "author": {"name": "N", "url": ""},
+        }
+        self.assertEqual(build_reply_text(en), "Original:\n\nhi\n\nترجمه فارسی:\n\nسلام\n\n— N")
+
+
 if __name__ == "__main__":
     unittest.main()

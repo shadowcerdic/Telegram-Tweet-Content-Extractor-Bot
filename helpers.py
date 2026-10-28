@@ -71,11 +71,11 @@ def _author_signature(author: Any) -> str:
     return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
-def build_reply_text(tweet: dict[str, Any]) -> str | None:
-    """Text for the Telegram reply: tweet text (+ translation) and author."""
+def _tweet_body(tweet: dict[str, Any]) -> str:
+    """Tweet text, plus the Persian translation when there is a real one."""
     original = normalize_tweet_text(tweet.get("text"))
     if not original:
-        return None
+        return ""
 
     lang = (tweet.get("lang") or "").strip().lower()
     translation = tweet.get("translation")
@@ -84,13 +84,55 @@ def build_reply_text(tweet: dict[str, Any]) -> str | None:
         if isinstance(translation, dict)
         else ""
     )
-    signature = _author_signature(tweet.get("author"))
 
     if lang == TRANSLATE_TO or not translated or translated == original:
-        return original + signature
+        return original
 
     label = "ترجمه فارسی" if TRANSLATE_TO == "fa" else f"Translation ({TRANSLATE_TO})"
-    return f"Original:\n\n{original}\n\n{label}:\n\n{translated}{signature}"
+    return f"Original:\n\n{original}\n\n{label}:\n\n{translated}"
+
+
+def build_reply_text(tweet: dict[str, Any]) -> str | None:
+    """Text for the Telegram reply: tweet text (+ translation) and author."""
+    body = _tweet_body(tweet)
+    if not body:
+        return None
+    return body + _author_signature(tweet.get("author"))
+
+
+def quote_author_label(tweet: dict[str, Any] | None) -> str:
+    """"Full Name (@handle)" for a quoted post, tolerating a missing author."""
+    data = tweet if isinstance(tweet, dict) else {}
+    author = data.get("author") if isinstance(data.get("author"), dict) else {}
+    name = (author.get("name") or "").strip()
+    screen = (author.get("screen_name") or "").strip()
+    if name and screen:
+        return f"{name} (@{screen})"
+    return name or screen or "کاربر دیگر"
+
+
+def build_quote_section(
+    quote_tweet: dict[str, Any] | None, unavailable: str | None = None
+) -> str:
+    """The quoted-post block, rendered under the outer tweet like Twitter's card.
+
+    Returns "" when the tweet is not a quote post, so callers can append it
+    unconditionally.
+    """
+    if unavailable:
+        return f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄\n↩️ توییت نقل‌قول‌شده در دسترس نیست ({unavailable})."
+    if not isinstance(quote_tweet, dict):
+        return ""
+
+    body = _tweet_body(quote_tweet)
+    if not body:
+        return ""
+
+    parts = ["┄┄┄┄┄┄┄┄┄┄┄┄", f"↩️ نقل‌قول از {quote_author_label(quote_tweet)}:", "", body]
+    url = (quote_tweet.get("url") or "").strip()
+    if url:
+        parts += ["", f"🔗 {url}"]
+    return "\n\n" + "\n".join(parts)
 
 
 def _split_long_line(line: str, max_length: int) -> list[str]:

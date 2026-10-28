@@ -34,6 +34,12 @@ class TweetPayload:
     # Videos that could not fit Telegram's upload ceiling (even at lowest variant).
     # Each entry is (label, url, est_bytes) so caller can offer a direct link.
     oversized_videos: list[dict[str, Any]] = field(default_factory=list)
+    # Quote post (retweet with comment): the quoted tweet parsed with the exact
+    # same media rules. None when the tweet is not a quote post.
+    quote: "TweetPayload | None" = None
+    # When X reports the quoted post as unavailable, the tombstone reason
+    # ("deleted", "protected", ...) instead of silently dropping it.
+    quote_unavailable: str | None = None
 
     def media_items(self) -> list[MediaItem]:
         return [MediaItem("photo", url) for url in self.photos] + [
@@ -140,11 +146,41 @@ def _pick_best_fitting_video(video: dict[str, Any], max_bytes: int = MAX_UPLOAD_
     }
 
 
-def get_tweet_payload(tweet_id: str, translate_to: str | None = None) -> TweetPayload | None:
-    """Fetch a tweet via FxTwitter.
+def _extract_media(tweet: dict[str, Any]) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """(photos, fitting videos, oversized videos) for one tweet object."""
+    media = tweet.get("media") or {}
+    photos = _urls(media.get("photos"))
 
-    Returns ``None`` if the tweet doesn't exist / isn't accessible. Network and
-    server errors raise ``requests.RequestException``.
+    videos: list[str] = []
+    oversized: list[dict[str, Any]] = []
+
+    for v in media.get("videos") or []:
+        if not isinstance(v, dict):
+            continue
+        chosen_url, over_info = _pick_best_fitting_video(v)
+        if chosen_url:
+            videos.append(chosen_url)
+        elif over_info:
+            oversized.append(over_info)
+
+    return photos, videos, oversized
+
+
+def _build_payload(tweet: dict[str, Any]) -> TweetPayload:
+    photos, videos, oversized = _extract_media(tweet)
+    return TweetPayload(
+        tweet=tweet,
+        photos=photos,
+        videos=videos,
+        oversized_videos=oversized,
+    )
+
+
+def _fetch_tweet_raw(tweet_id: str, translate_to: str | None = None) -> dict[str, Any] | None:
+    """One FxTwitter lookup -> the raw tweet object, or None when unavailable.
+
+    Network/server errors raise ``requests.RequestException`` — callers decide how
+    loudly to fail.
     """
     url = f"{FXTWITTER_API_BASE}/i/status/{tweet_id}"
     if translate_to:
@@ -161,27 +197,68 @@ def get_tweet_payload(tweet_id: str, translate_to: str | None = None) -> TweetPa
         return None
 
     tweet = data.get("tweet")
-    if not isinstance(tweet, dict):
+    return tweet if isinstance(tweet, dict) else None
+
+
+def _parse_quote(raw: Any, translate_to: str | None) -> tuple[TweetPayload | None, str | None]:
+    """Resolve ``tweet["quote"]`` into (payload, unavailable_reason).
+
+    FxTwitter embeds the quoted tweet with full media (including per-variant
+    bitrates, so the 50 MB picker works unchanged on it) but WITHOUT a
+    ``translation`` — the translate endpoint only translates the focal tweet. When
+    the quoted post is in another language we therefore re-fetch it by id with the
+    translation suffix. If that second call fails or comes back empty we keep the
+    nested object: an untranslated quote still beats a missing one.
+
+    Depth is capped at 1: a quote inside the quoted post is not rendered.
+    """
+    if not isinstance(raw, dict):
+        return None, None
+
+    if (raw.get("type") or "").lower() == "tombstone":
+        return None, str(raw.get("reason") or "unavailable")
+
+    quote_id = str(raw.get("id") or "")
+    if not quote_id or not (raw.get("text") or raw.get("media")):
+        return None, None
+
+    lang = (raw.get("lang") or "").strip().lower()
+    if (
+        translate_to
+        and lang
+        and lang != translate_to
+        and not (raw.get("translation") or {}).get("text")
+    ):
+        try:
+            refreshed = _fetch_tweet_raw(quote_id, translate_to)
+        except requests.RequestException as exc:
+            log.info("quote %s: translate fetch failed (%s); keeping original text", quote_id, exc)
+            refreshed = None
+        if refreshed:
+            raw = refreshed
+
+    payload = _build_payload(raw)
+    payload.quote = None
+    payload.quote_unavailable = None
+    return payload, None
+
+
+def get_tweet_payload(tweet_id: str, translate_to: str | None = None) -> TweetPayload | None:
+    """Fetch a tweet (and the tweet it quotes, if any) via FxTwitter.
+
+    Returns ``None`` if the tweet doesn't exist / isn't accessible. Network and
+    server errors raise ``requests.RequestException``.
+    """
+    tweet = _fetch_tweet_raw(tweet_id, translate_to)
+    if tweet is None:
         return None
 
-    media = tweet.get("media") or {}
-    photos = _urls(media.get("photos"))
+    payload = _build_payload(tweet)
 
-    videos: list[str] = []
-    oversized: list[dict[str, Any]] = []
+    quote, unavailable = _parse_quote(tweet.get("quote"), translate_to)
+    if quote is not None and str(quote.tweet.get("id") or "") == str(tweet_id):
+        quote, unavailable = None, None  # self-referential quote: nothing to add
+    payload.quote = quote
+    payload.quote_unavailable = unavailable
 
-    for v in media.get("videos") or []:
-        if not isinstance(v, dict):
-            continue
-        chosen_url, over_info = _pick_best_fitting_video(v)
-        if chosen_url:
-            videos.append(chosen_url)
-        elif over_info:
-            oversized.append(over_info)
-
-    return TweetPayload(
-        tweet=tweet,
-        photos=photos,
-        videos=videos,
-        oversized_videos=oversized,
-    )
+    return payload

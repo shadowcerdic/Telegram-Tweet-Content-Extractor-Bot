@@ -22,6 +22,7 @@ from constants import (
 )
 from downloader import download_media
 from helpers import (
+    build_quote_section,
     build_reply_text,
     chunk_media_items,
     chunk_text,
@@ -29,6 +30,7 @@ from helpers import (
     extract_tweet_ids,
     extract_youtube_ids,
     load_last_update_id,
+    quote_author_label,
     save_last_update_id,
 )
 from instagram_client import MediaFetchError, downloaded_instagram_media, purge_temp_dir
@@ -167,35 +169,55 @@ def send_chunk(ctx: Ctx, chunk: list[MediaItem], caption: str | None, reply: boo
             _send_chunk_once(ctx, local, caption, reply)
 
 
-def deliver(ctx: Ctx, items: list[MediaItem], text: str | None) -> None:
+def deliver(
+    ctx: Ctx,
+    items: list[MediaItem],
+    text: str | None,
+    extra_items: list[MediaItem] | None = None,
+    extra_caption: str | None = None,
+) -> None:
     """Send ``items`` with ``text``.
 
     The text is used as the caption when it fits Telegram's limit; otherwise it
     is sent first as normal message(s) and the media follows.
+
+    ``extra_items`` is the media of a quoted post: it goes out after the outer
+    tweet's media and wears ``extra_caption`` (the quoted author) on its first
+    chunk, so it is always obvious which file came from which tweet. When the
+    outer tweet has no media of its own, the full text rides on the first quote
+    chunk instead — same single-message feel as Twitter.
     """
     text = (text or "").strip()
+    items = list(items or [])
+    extra_items = list(extra_items or [])
 
-    if not items:
+    if not items and not extra_items:
         if text:
             send_text(ctx, text)
         return
 
-    fits = len(text) <= CAPTION_LIMIT
     reply_to_original = True
-
-    if text and not fits:
+    text_caption = text if (text and len(text) <= CAPTION_LIMIT) else None
+    if text and text_caption is None:
         send_text(ctx, text)
         reply_to_original = False
 
-    caption = text if (text and fits) else None
-    for index, chunk in enumerate(chunk_media_items(items)):
-        first = index == 0
-        send_chunk(
-            ctx,
-            chunk,
-            caption=caption if first else None,
-            reply=reply_to_original and first,
-        )
+    pending_extra_caption = extra_caption
+    for chunk, is_quote in [
+        (c, False) for c in chunk_media_items(items)
+    ] + [
+        (c, True) for c in chunk_media_items(extra_items)
+    ]:
+        if not is_quote:
+            caption, text_caption = text_caption, None
+        else:
+            caption, text_caption, pending_extra_caption = (
+                text_caption or pending_extra_caption,
+                None,
+                None,
+            )
+        send_chunk(ctx, chunk, caption=caption, reply=reply_to_original)
+        reply_to_original = False
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +225,11 @@ def deliver(ctx: Ctx, items: list[MediaItem], text: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def handle_instagram(ctx: Ctx, shortcode: str) -> None:
+def _oversized_note(url: Any, label: str) -> str:
+    return f"⚠️ {label} ({url}) بزرگتر از سقف ۵۰ مگابایت تلگرام است و مستقیماً ارسال نشد."
+
+
+def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = frozenset()) -> None:
     status = Status(ctx, "Processing Instagram link...")
     try:
         status.update("Downloading media...")
@@ -224,7 +250,8 @@ def handle_instagram(ctx: Ctx, shortcode: str) -> None:
         status.error("Failed to process Instagram link.")
 
 
-def handle_tweet(ctx: Ctx, tweet_id: str) -> None:
+def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()) -> None:
+    """Deliver a tweet, and the post it quotes (quote tweet) as a Twitter-style card."""
     status = Status(ctx, "Processing X link...")
     try:
         status.update("Fetching post content...")
@@ -251,28 +278,55 @@ def handle_tweet(ctx: Ctx, tweet_id: str) -> None:
                 if retry is not None and _has_translation(retry):
                     payload = retry
 
+        quote = payload.quote
+        if quote is not None and str(quote.tweet.get("id") or "") in siblings:
+            # The quoted post was pasted as its own link too, so it already gets a
+            # full delivery of its own; rendering the card here would post it twice.
+            log.info(
+                "Tweet %s: quoted tweet %s is also linked directly; skipping inline card",
+                tweet_id,
+                quote.tweet.get("id"),
+            )
+            quote = None
+            payload.quote_unavailable = None
+
         text = build_reply_text(payload.tweet) or ""
-        if payload.oversized_videos:
-            notes = [
-                f"⚠️ ویدیو ({ov.get('url', '')}) بزرگتر از سقف ۵۰ مگابایت تلگرام است و مستقیماً ارسال نشد."
-                for ov in payload.oversized_videos
+        text = (
+            text
+            + build_quote_section(quote.tweet if quote is not None else None, payload.quote_unavailable)
+        ).strip()
+
+        notes = [_oversized_note(ov.get("url", ""), "ویدیو") for ov in payload.oversized_videos]
+        if quote is not None:
+            notes += [
+                _oversized_note(ov.get("url", ""), "ویدیوی توییت نقل‌قول‌شده")
+                for ov in quote.oversized_videos
             ]
+        if notes:
             text = (text + "\n\n" + "\n".join(notes)).strip()
+
         items = payload.media_items()
+        quote_items = quote.media_items() if quote is not None else []
+        quote_caption = (
+            f"📎 پیوست توییت نقل‌قول‌شده — {quote_author_label(quote.tweet)}"
+            if quote is not None
+            else None
+        )
         log.info(
-            "Tweet %s: lang=%r translated=%r same_as_original=%r reply_has_translation=%r",
+            "Tweet %s: lang=%r translated=%r same_as_original=%r reply_has_translation=%r quote=%r",
             tweet_id,
             payload.tweet.get("lang"),
             (payload.tweet.get("translation") or {}).get("text", "")[:50],
             (payload.tweet.get("translation") or {}).get("text", "") == payload.tweet.get("text"),
             "ترجمه" in text,
+            quote.tweet.get("id") if quote is not None else payload.quote_unavailable,
         )
-        if not items and not text:
+        if not items and not quote_items and not text:
             status.error("Tweet content was empty.")
             return
 
         status.update("Sending content...")
-        deliver(ctx, items, text)
+        deliver(ctx, items, text, extra_items=quote_items, extra_caption=quote_caption)
         status.finish()
     except (requests.RequestException, TelegramError) as exc:
         log.warning("X link failed (%s): %s", tweet_id, exc)
@@ -282,7 +336,9 @@ def handle_tweet(ctx: Ctx, tweet_id: str) -> None:
         status.error("Failed to process X link.")
 
 
-def handle_youtube_prompt(ctx: Ctx, video_id: str) -> None:
+def handle_youtube_prompt(
+    ctx: Ctx, video_id: str, _siblings: frozenset[str] = frozenset()
+) -> None:
     """Prompt the user with format choices when a YouTube link is detected."""
     ctx.action("typing")
     info = get_video_info(video_id)
@@ -418,16 +474,21 @@ def process_message(message: dict[str, Any]) -> None:
         thread_id=message.get("message_thread_id") if message.get("is_topic_message") else None,
     )
 
-    jobs: list[tuple[Callable[[Ctx, str], None], str]] = [
+    tweet_ids = extract_tweet_ids(text)
+    # Every tweet id in this message, so a handler can tell that a quoted post is
+    # already being delivered on its own instead of posting it a second time.
+    siblings = frozenset(tweet_ids)
+
+    jobs: list[tuple[Callable[[Ctx, str, frozenset[str]], None], str]] = [
         (handle_instagram, code) for code in extract_instagram_shortcodes(text)
     ] + [
-        (handle_tweet, tweet_id) for tweet_id in extract_tweet_ids(text)
+        (handle_tweet, tweet_id) for tweet_id in tweet_ids
     ] + [
         (handle_youtube_prompt, yt_id) for yt_id in extract_youtube_ids(text)
     ]
 
     for handler, link_id in jobs[:MAX_LINKS_PER_MESSAGE]:
-        handler(ctx, link_id)
+        handler(ctx, link_id, siblings)
 
 
 def process_update(update: dict[str, Any]) -> None:

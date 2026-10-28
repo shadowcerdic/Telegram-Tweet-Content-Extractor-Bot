@@ -64,8 +64,8 @@ class XClient(unittest.TestCase):
                 x_client.get_tweet_payload("1")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class VideoVariantPicker(unittest.TestCase):
+    """These two ran zero times before: they lived inside the __main__ block."""
 
     def test_pick_best_fitting_video_prefers_highest_quality_under_cap(self):
         from x_client import _pick_best_fitting_video
@@ -95,3 +95,107 @@ if __name__ == "__main__":
         self.assertIsNone(url)
         self.assertIsNotNone(over)
         self.assertEqual(over["url"], "https://v/huge.mp4")
+
+
+def _tweet(text="t", lang="fa", author=None, media=None, **extra):
+    """A minimal FxTwitter tweet object with the keys the bot reads."""
+    return {
+        "id": extra.pop("id", "1"),
+        "text": text,
+        "lang": lang,
+        "author": author if author is not None else {"name": "A", "screen_name": "a"},
+        "media": media or {},
+        **extra,
+    }
+
+
+def _envelope(tweet):
+    return {"code": 200, "tweet": tweet}
+
+
+def _fetched(*args, **kwargs) -> x_client.TweetPayload:
+    """get_tweet_payload, narrowed so the assertions below are honest."""
+    result = x_client.get_tweet_payload(*args, **kwargs)
+    assert result is not None
+    return result
+
+
+class XClientQuote(unittest.TestCase):
+    """A quote post must come back as a second, fully parsed payload."""
+
+    def test_quote_media_uses_the_same_50mb_picker(self):
+        quoted_video = {
+            "duration": 100.0,
+            "url": "https://v/hq.mp4",
+            "formats": [
+                {"url": "https://v/lo.mp4", "bitrate": 200_000, "container": "mp4"},
+                {"url": "https://v/hq.mp4", "bitrate": 25_000_000, "container": "mp4"},
+            ],
+        }
+        payload = _envelope(_tweet(
+            text="outer",
+            quote=_tweet(id="2", text="quoted", media={"videos": [quoted_video]}),
+        ))
+        with mock.patch.object(x_client._session, "get", return_value=resp(200, payload)) as get:
+            result = _fetched("1")
+        quote = result.quote
+        assert quote is not None
+        # 25 Mbps over 100 s is ~350 MB, 0.2 Mbps fits -> the low variant is chosen.
+        self.assertEqual(quote.videos, ["https://v/lo.mp4"])
+        self.assertEqual(get.call_count, 1)  # already Persian: no extra translate fetch
+
+    def test_foreign_quote_is_refetched_with_translation(self):
+        payload = _envelope(_tweet(text="outer", quote=_tweet(id="2", text="hello", lang="en")))
+        refreshed = _envelope(_tweet(id="2", text="hello", lang="en",
+                                     translation={"text": "سلام"}))
+        with mock.patch.object(x_client._session, "get",
+                               side_effect=[resp(200, payload), resp(200, refreshed)]) as get:
+            result = _fetched("1", translate_to="fa")
+        quote = result.quote
+        assert quote is not None
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertEqual(urls[1], "https://api.fxtwitter.com/i/status/2/fa")
+        self.assertEqual(quote.tweet["translation"]["text"], "سلام")
+
+    def test_translation_refetch_failure_keeps_the_quote(self):
+        """A dead translate call must not lose the quoted tweet or crash the handler."""
+        payload = _envelope(_tweet(text="outer", quote=_tweet(id="2", text="hello", lang="en")))
+        with mock.patch.object(x_client._session, "get",
+                               side_effect=[resp(200, payload), requests.RequestException("down")]):
+            result = _fetched("1", translate_to="fa")
+        quote = result.quote
+        assert quote is not None
+        self.assertEqual(quote.tweet["text"], "hello")  # untranslated, still delivered
+
+    def test_deleted_quote_becomes_a_reason_not_a_crash(self):
+        payload = _envelope(_tweet(quote={"type": "tombstone", "reason": "deleted"}))
+        with mock.patch.object(x_client._session, "get", return_value=resp(200, payload)):
+            result = _fetched("1")
+        self.assertIsNone(result.quote)
+        self.assertEqual(result.quote_unavailable, "deleted")
+
+    def test_quote_depth_is_capped_at_one(self):
+        deep = _tweet(id="2", text="q2", quote=_tweet(id="3", text="q3"))
+        payload = _envelope(_tweet(text="outer", quote=deep))
+        with mock.patch.object(x_client._session, "get", return_value=resp(200, payload)):
+            result = _fetched("1")
+        quote = result.quote
+        assert quote is not None
+        self.assertIsNone(quote.quote)
+
+    def test_self_quote_is_ignored(self):
+        payload = _envelope(_tweet(id="1", text="outer", quote=_tweet(id="1", text="outer")))
+        with mock.patch.object(x_client._session, "get", return_value=resp(200, payload)):
+            result = _fetched("1")
+        self.assertIsNone(result.quote)
+
+    def test_plain_tweet_has_no_quote_fields(self):
+        payload = _envelope(_tweet(text="just a tweet"))
+        with mock.patch.object(x_client._session, "get", return_value=resp(200, payload)):
+            result = _fetched("1")
+        self.assertIsNone(result.quote)
+        self.assertIsNone(result.quote_unavailable)
+
+
+if __name__ == "__main__":
+    unittest.main()
