@@ -29,6 +29,23 @@ class InstagramCollect(unittest.TestCase):
             (Path(b) / "ABCdef.jpg").write_bytes(b"x")
             self.assertEqual(len(collect_media(Path(a))), 1)
 
+    def test_webp_image_is_converted_and_collected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            webp = Path(tmp) / "CODE_1.webp"
+            # generate real minimal webp so ffmpeg can convert it
+            import subprocess
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=10x10:d=1", "-vframes", "1", str(webp)],
+                capture_output=True,
+                check=True,
+            )
+            items = collect_media(Path(tmp))
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].kind, "photo")
+            self.assertTrue(items[0].source.endswith(".jpg"))
+            self.assertFalse(webp.exists())
+            self.assertTrue(Path(items[0].source).exists())
+
 
 def resp(status=200, payload=None):
     r = mock.Mock()
