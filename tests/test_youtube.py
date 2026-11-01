@@ -23,5 +23,18 @@ class YouTubeExtractionTests(unittest.TestCase):
         self.assertEqual(extract_youtube_ids("No youtube here"), [])
 
 
+class YouTubeFriendlyErrorTests(unittest.TestCase):
+    def test_maps_age_live_private_and_generic_errors(self):
+        from youtube_client import _friendly_youtube_error
+
+        self.assertIn("+۱۸", _friendly_youtube_error("ERROR: Sign in to confirm your age"))
+        self.assertIn("پخش زنده", _friendly_youtube_error("ERROR: This live event will begin in 2 hours"))
+        self.assertIn("خصوصی", _friendly_youtube_error("ERROR: Private video. Sign in if you've been granted access"))
+        self.assertEqual(
+            _friendly_youtube_error("ERROR: some internal extractor stack trace"),
+            "دریافت این ویدیو از یوتیوب ممکن نشد.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import html
 import logging
 import signal
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -19,6 +21,7 @@ from constants import (
     POLL_INTERVAL,
     PROCESS_EDITED_MESSAGES,
     TRANSLATE_TO,
+    WORKER_THREADS,
 )
 from downloader import download_media
 from helpers import (
@@ -154,19 +157,57 @@ def _send_chunk_once(
         send_media_group(ctx.chat_id, chunk, caption=caption, **ctx.target(reply))
 
 
-def send_chunk(ctx: Ctx, chunk: list[MediaItem], caption: str | None, reply: bool) -> None:
+def _needs_local_upload(item: MediaItem, force_local: bool) -> bool:
+    """Videos or forced-fallback items are downloaded locally; small photos stay URLs."""
+    return item.is_url and (force_local or item.kind == "video")
+
+
+def send_chunk(
+    ctx: Ctx,
+    chunk: list[MediaItem],
+    caption: str | None,
+    reply: bool,
+    force_local: bool = False,
+) -> bool:
+    """Send one chunk of media; returns True if URL delivery fell back to local upload."""
     ctx.action("upload_video" if any(i.kind == "video" for i in chunk) else "upload_photo")
+
+    if force_local and any(item.is_url for item in chunk):
+        with tempfile.TemporaryDirectory(prefix="tgbot_") as tmp:
+            local = [download_media(i, tmp) if i.is_url else i for i in chunk]
+            _send_chunk_once(ctx, local, caption, reply)
+        return True
+
     try:
         _send_chunk_once(ctx, chunk, caption, reply)
+        return force_local
     except TelegramError as exc:
         # 400 = Telegram couldn't fetch the URL itself (too large, blocked, ...).
-        # Download the files ourselves and upload them instead.
+        # Download videos first (Telegram caps URL videos at 20 MB while photos
+        # rarely fail); if that wasn't the culprit or still 400s, download all URLs.
         if exc.error_code != 400 or not any(item.is_url for item in chunk):
             raise
         log.info("Telegram rejected media URL (%s); retrying as upload", exc.description)
         with tempfile.TemporaryDirectory(prefix="tgbot_") as tmp:
-            local = [download_media(i, tmp) if i.is_url else i for i in chunk]
+            has_url_video = any(i.is_url and i.kind == "video" for i in chunk)
+            has_url_photo = any(i.is_url and i.kind == "photo" for i in chunk)
+            if len(chunk) > 1 and has_url_video and has_url_photo:
+                partial = [
+                    download_media(i, tmp) if _needs_local_upload(i, False) else i
+                    for i in chunk
+                ]
+                try:
+                    _send_chunk_once(ctx, partial, caption, reply)
+                    return True
+                except TelegramError as exc2:
+                    if exc2.error_code != 400:
+                        raise
+            local = [
+                download_media(i, tmp) if i.is_url else i
+                for i in chunk
+            ]
             _send_chunk_once(ctx, local, caption, reply)
+        return True
 
 
 def deliver(
@@ -203,6 +244,7 @@ def deliver(
         reply_to_original = False
 
     pending_extra_caption = extra_caption
+    force_local = False
     for chunk, is_quote in [
         (c, False) for c in chunk_media_items(items)
     ] + [
@@ -216,7 +258,9 @@ def deliver(
                 None,
                 None,
             )
-        send_chunk(ctx, chunk, caption=caption, reply=reply_to_original)
+        force_local = send_chunk(
+            ctx, chunk, caption=caption, reply=reply_to_original, force_local=force_local
+        )
         reply_to_original = False
 
 
@@ -230,16 +274,18 @@ def _oversized_note(url: Any, label: str) -> str:
 
 
 def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = frozenset()) -> None:
-    status = Status(ctx, "Processing Instagram link...")
+    status = Status(ctx, "⏳ در حال بررسی لینک اینستاگرام...")
     try:
-        status.update("Downloading media...")
+        status.update("📥 در حال دانلود مدیا از اینستاگرام...")
         ctx.action("upload_document")
 
         with downloaded_instagram_media(shortcode) as (items, caption):
             if not items:
-                status.error("Could not fetch that Instagram media.")
+                log.warning("Instagram %s: download finished with zero media items", shortcode)
+                status.error("❌ مدیای قابل ارسالی در این پست اینستاگرام یافت نشد.")
                 return
-            status.update("Sending media...")
+            log.info("Instagram %s: delivering %d item(s)", shortcode, len(items))
+            status.update("📤 در حال ارسال مدیا...")
             deliver(ctx, items, caption)
 
         status.finish()
@@ -247,20 +293,20 @@ def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = froze
         status.error(str(exc))
     except Exception:  # noqa: BLE001 - one bad link must not stop the bot
         log.exception("Instagram link failed: %s", shortcode)
-        status.error("Failed to process Instagram link.")
+        status.error("❌ خطا در پردازش لینک اینستاگرام.")
 
 
 def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()) -> None:
     """Deliver a tweet, and the post it quotes (quote tweet) as a Twitter-style card."""
-    status = Status(ctx, "Processing X link...")
+    status = Status(ctx, "⏳ در حال بررسی لینک X...")
     try:
-        status.update("Fetching post content...")
+        status.update("📥 در حال دریافت محتوای توییت...")
         ctx.action("typing")
 
         payload = get_tweet_payload(tweet_id, translate_to=TRANSLATE_TO or None)
         if payload is None:
             log.info("Tweet %s: fetch returned nothing", tweet_id)
-            status.error("Could not fetch that tweet text.")
+            status.error("❌ دریافت این توییت ممکن نشد (حذف شده یا حساب خصوصی است).")
             return
 
         # Translation gaps (transient AND the deterministic per-language ones) are
@@ -311,18 +357,18 @@ def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()
             quote.tweet.get("id") if quote is not None else payload.quote_unavailable,
         )
         if not items and not quote_items and not text:
-            status.error("Tweet content was empty.")
+            status.error("❌ محتوای این توییت خالی است.")
             return
 
-        status.update("Sending content...")
+        status.update("📤 در حال ارسال به تلگرام...")
         deliver(ctx, items, text, extra_items=quote_items, extra_caption=quote_caption)
         status.finish()
     except (requests.RequestException, TelegramError) as exc:
         log.warning("X link failed (%s): %s", tweet_id, exc)
-        status.error("Failed to process X link.")
+        status.error("❌ خطا در پردازش لینک X.")
     except Exception:  # noqa: BLE001
         log.exception("X link failed: %s", tweet_id)
-        status.error("Failed to process X link.")
+        status.error("❌ خطا در پردازش لینک X.")
 
 
 def handle_youtube_prompt(
@@ -331,7 +377,7 @@ def handle_youtube_prompt(
     """Prompt the user with format choices when a YouTube link is detected."""
     ctx.action("typing")
     info = get_video_info(video_id)
-    title = info.title if info else "YouTube Video"
+    title = html.escape(info.title if info else "YouTube Video")
 
     keyboard = {
         "inline_keyboard": [
@@ -359,6 +405,7 @@ def handle_youtube_prompt(
         reply_to_message_id=ctx.message_id,
         message_thread_id=ctx.thread_id,
         reply_markup=keyboard,
+        parse_mode="HTML",
     )
 
 
@@ -418,9 +465,11 @@ def handle_youtube_callback(callback_query: dict[str, Any]) -> None:
         delete_message(chat_id, message_id)
     except YoutubeOversizedError as exc:
         edit_message_text(chat_id, message_id, f"⚠️ {exc}")
-    except Exception as exc:  # noqa: BLE001
+    except YoutubeError as exc:
+        edit_message_text(chat_id, message_id, f"❌ {exc}")
+    except Exception:  # noqa: BLE001
         log.exception("YouTube download failed for %s (%s)", video_id, fmt_key)
-        edit_message_text(chat_id, message_id, f"❌ خطا در پردازش یوتیوب: {exc}")
+        edit_message_text(chat_id, message_id, "❌ خطا در پردازش لینک یوتیوب.")
 
 
 # ---------------------------------------------------------------------------
@@ -546,35 +595,44 @@ def main() -> None:
     log.info("Bye.")
 
 
+def _run_update_safely(update: dict[str, Any]) -> None:
+    update_id = update.get("update_id")
+    try:
+        process_update(update)
+    except Exception:  # noqa: BLE001
+        # Log and move on. The offset is advanced regardless, otherwise
+        # one failing update would be re-fetched and re-fail forever.
+        log.exception("Update %s failed", update_id)
+
+
 def run_loop() -> None:
     offset = load_last_update_id(OFFSET_FILE)
     failures = 0
+    inflight: set[Future[None]] = set()
 
-    while not _stop:
-        try:
-            updates = get_updates(offset, allow_edited=PROCESS_EDITED_MESSAGES)
-            failures = 0
-        except Exception as exc:  # noqa: BLE001 - network hiccups, 409 conflicts, ...
-            failures += 1
-            delay = min(3 * 2 ** (failures - 1), 60)  # 3s, 6s, 12s ... max 60s
-            log.warning("getUpdates failed (%s); retrying in %ss", exc, delay)
-            time.sleep(delay)
-            continue
+    with ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="tgworker") as pool:
+        while not _stop:
+            inflight = {f for f in inflight if not f.done()}
 
-        for update in updates:
-            update_id = update["update_id"]
-            log.info("Processing update_id=%s", update_id)
             try:
-                process_update(update)
-            except Exception:  # noqa: BLE001
-                # Log and move on. The offset is advanced regardless, otherwise
-                # one failing update would be re-fetched and re-fail forever.
-                log.exception("Update %s failed", update_id)
-            offset = update_id + 1
-            save_last_update_id(OFFSET_FILE, offset)
+                updates = get_updates(offset, allow_edited=PROCESS_EDITED_MESSAGES)
+                failures = 0
+            except Exception as exc:  # noqa: BLE001 - network hiccups, 409 conflicts, ...
+                failures += 1
+                delay = min(3 * 2 ** (failures - 1), 60)  # 3s, 6s, 12s ... max 60s
+                log.warning("getUpdates failed (%s); retrying in %ss", exc, delay)
+                time.sleep(delay)
+                continue
 
-        if not updates:
-            time.sleep(POLL_INTERVAL)
+            for update in updates:
+                update_id = update["update_id"]
+                log.info("Processing update_id=%s", update_id)
+                offset = update_id + 1
+                save_last_update_id(OFFSET_FILE, offset)
+                inflight.add(pool.submit(_run_update_safely, update))
+
+            if not updates:
+                time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":

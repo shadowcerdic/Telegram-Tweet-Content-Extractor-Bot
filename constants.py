@@ -14,6 +14,13 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _int_env(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -67,3 +74,4 @@ CAPTION_LIMIT = 1024  # Telegram caption limit
 MEDIA_GROUP_MAX = 10  # Telegram album limit
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Bot API upload limit
 MAX_LINKS_PER_MESSAGE = 5  # protects against link-spam in groups
+WORKER_THREADS = _int_env("WORKER_THREADS", 3)  # concurrent update workers

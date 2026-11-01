@@ -75,6 +75,37 @@ class Deliver(unittest.TestCase):
                 main.deliver(self.ctx, [URL_VIDEO], None)
         dl.assert_not_called()
 
+    def test_mixed_album_fallback_downloads_only_video_first(self):
+        self.m["send_media_group"].side_effect = [
+            TelegramError("sendMediaGroup", "Bad Request: failed to get HTTP URL content", 400),
+            None,
+        ]
+        local_vid = MediaItem("video", "/tmp/local.mp4")
+        with mock.patch.object(main, "download_media", return_value=local_vid) as dl:
+            main.deliver(self.ctx, [URL_PHOTO, URL_VIDEO], "cap")
+        dl.assert_called_once_with(URL_VIDEO, mock.ANY)
+        retried_group = self.m["send_media_group"].call_args_list[1].args[1]
+        self.assertEqual(retried_group, [URL_PHOTO, local_vid])
+
+    def test_fallback_propagates_to_second_chunk(self):
+        self.m["send_media"].side_effect = [
+            TelegramError("sendVideo", "Bad Request: failed to get HTTP URL content", 400),
+            None,
+            None,
+        ]
+        local = MediaItem("photo", "/tmp/local.jpg")
+        with mock.patch.object(main, "download_media", return_value=local) as dl:
+            main.deliver(
+                self.ctx,
+                [URL_VIDEO],
+                "cap",
+                extra_items=[URL_PHOTO],
+                extra_caption="quote",
+            )
+        # First chunk hit 400 -> downloaded URL_VIDEO; second chunk inherited force_local -> downloaded URL_PHOTO directly
+        self.assertEqual(dl.call_count, 2)
+        self.assertEqual(self.m["send_media"].call_count, 3)
+
 
 class MessageParsing(unittest.TestCase):
     def test_hidden_link_in_text_link_entity_is_found(self):
@@ -137,7 +168,7 @@ class TweetHandler(unittest.TestCase):
              mock.patch.object(main, "send_chat_action"), \
              mock.patch.object(main, "get_tweet_payload", return_value=None):
             main.handle_tweet(ctx, "1")
-        self.assertEqual(edit.call_args.args[2], "Could not fetch that tweet text.")
+        self.assertIn("دریافت این توییت ممکن نشد", edit.call_args.args[2])
 
     def test_unexpected_exception_is_contained(self):
         ctx = Ctx(1, 2)
@@ -146,7 +177,43 @@ class TweetHandler(unittest.TestCase):
              mock.patch.object(main, "send_chat_action"), \
              mock.patch.object(main, "get_tweet_payload", side_effect=ValueError("bad json")):
             main.handle_tweet(ctx, "1")  # must not raise
-        self.assertEqual(edit.call_args.args[2], "Failed to process X link.")
+        self.assertEqual(edit.call_args.args[2], "❌ خطا در پردازش لینک X.")
+
+
+class YoutubeHandlers(unittest.TestCase):
+    def test_prompt_escapes_html_and_sets_parse_mode(self):
+        from youtube_client import YoutubeInfo
+
+        ctx = Ctx(10, 20)
+        info = YoutubeInfo(video_id="dQw4w9WgXcQ", title="A < B & C > D", duration=10, thumbnail=None)
+        with mock.patch.object(main, "get_video_info", return_value=info), \
+             mock.patch.object(main, "send_chat_action"), \
+             mock.patch.object(main, "send_message") as send:
+            main.handle_youtube_prompt(ctx, "dQw4w9WgXcQ")
+        self.assertEqual(send.call_args.kwargs.get("parse_mode"), "HTML")
+        sent_text = send.call_args.args[1]
+        self.assertIn("<b>A &lt; B &amp; C &gt; D</b>", sent_text)
+
+    def test_callback_renders_clean_persian_youtube_error(self):
+        from youtube_client import YoutubeError
+
+        cq = {
+            "id": "cq1",
+            "data": "yt:dQw4w9WgXcQ:high",
+            "message": {"message_id": 55, "chat": {"id": 10}},
+        }
+        with mock.patch.object(main, "answer_callback_query"), \
+             mock.patch.object(main, "send_chat_action"), \
+             mock.patch.object(main, "edit_message_text") as edit, \
+             mock.patch.object(
+                 main,
+                 "download_youtube_media",
+                 side_effect=YoutubeError("این ویدیوی یوتیوب محدودیت سنی (+۱۸) دارد و بدون لاگین اکانت قابل دانلود نیست."),
+             ):
+            main.handle_youtube_callback(cq)
+        final_msg = edit.call_args_list[-1].args[2]
+        self.assertIn("محدودیت سنی", final_msg)
+        self.assertNotIn("Traceback", final_msg)
 
 
 class RunLoop(unittest.TestCase):
@@ -176,8 +243,47 @@ class RunLoop(unittest.TestCase):
             main.run_loop()
         main._stop = False
 
-        self.assertEqual(processed, [1, 2])
+        self.assertCountEqual(processed, [1, 2])
         self.assertEqual([c.args[1] for c in save.call_args_list], [2, 3])
+
+    def test_slow_update_does_not_block_concurrent_update(self):
+        import threading
+
+        gate = threading.Event()
+        second_finished = threading.Event()
+        batches = [[{"update_id": 10}, {"update_id": 11}]]
+
+        def fake_get_updates(offset, allow_edited=False):
+            if batches:
+                return batches.pop()
+            second_finished.wait(timeout=2)
+            main._stop = True
+            gate.set()
+            return []
+
+        order = []
+
+        def fake_process(update):
+            uid = update["update_id"]
+            if uid == 10:
+                gate.wait(timeout=2)
+                order.append(10)
+            else:
+                order.append(11)
+                second_finished.set()
+
+        main._stop = False
+        with mock.patch.object(main, "get_updates", side_effect=fake_get_updates), \
+             mock.patch.object(main, "process_update", side_effect=fake_process), \
+             mock.patch.object(main, "save_last_update_id"), \
+             mock.patch.object(main, "load_last_update_id", return_value=None), \
+             mock.patch.object(main.time, "sleep"):
+            main.run_loop()
+        main._stop = False
+
+        # Update 11 finished while update 10 was still waiting on gate!
+        self.assertEqual(order[0], 11)
+        self.assertIn(10, order)
 
 
 def _quote_payload(

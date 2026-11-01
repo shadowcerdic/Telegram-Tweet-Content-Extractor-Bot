@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 import requests
+import threading
 
 import constants
 from constants import (
@@ -23,9 +24,20 @@ from models import MediaItem
 log = logging.getLogger(__name__)
 
 _session = requests.Session()
+_local = threading.local()
 
 # Don't sleep longer than this when Telegram asks us to back off (429).
 _MAX_RETRY_AFTER = 30
+
+
+def _get_session() -> requests.Session:
+    if threading.current_thread() is threading.main_thread():
+        return _session
+    sess = getattr(_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _local.session = sess
+    return sess
 
 
 class TelegramError(Exception):
@@ -85,17 +97,18 @@ def _call(
     data = {k: v for k, v in (data or {}).items() if v is not None}
 
     for attempt in range(retries + 1):
+        sess = _get_session()
         try:
             if files:
                 _rewind(files)
-                response = _session.post(
+                response = sess.post(
                     _api_url(method),
                     data={k: _form_value(v) for k, v in data.items()},
                     files=files,
                     timeout=timeout,
                 )
             else:
-                response = _session.post(_api_url(method), json=data, timeout=timeout)
+                response = sess.post(_api_url(method), json=data, timeout=timeout)
         except requests.RequestException as exc:
             raise TelegramError(method, f"network error ({type(exc).__name__})") from None
 
@@ -167,12 +180,15 @@ def send_message(
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
     reply_markup: dict[str, Any] | None = None,
+    parse_mode: str | None = None,
 ) -> dict[str, Any]:
     data = _target(chat_id, reply_to_message_id, message_thread_id)
     data["text"] = text
     data["link_preview_options"] = {"is_disabled": True}
     if reply_markup is not None:
         data["reply_markup"] = reply_markup
+    if parse_mode is not None:
+        data["parse_mode"] = parse_mode
     return _call("sendMessage", data)
 
 
@@ -181,6 +197,7 @@ def edit_message_text(
     message_id: int,
     text: str,
     reply_markup: dict[str, Any] | None = None,
+    parse_mode: str | None = None,
 ) -> None:
     data = {
         "chat_id": chat_id,
@@ -190,6 +207,8 @@ def edit_message_text(
     }
     if reply_markup is not None:
         data["reply_markup"] = reply_markup
+    if parse_mode is not None:
+        data["parse_mode"] = parse_mode
     _call("editMessageText", data)
 
 

@@ -24,6 +24,24 @@ class YoutubeOversizedError(YoutubeError):
     """Media exceeds the 50MB upload limit."""
 
 
+def _friendly_youtube_error(raw: str) -> str:
+    """Map noisy yt-dlp exception strings to a clean, single-line Persian message."""
+    low = (raw or "").lower()
+    if "sign in to confirm your age" in low or "age-restricted" in low or "inappropriate for some users" in low:
+        return "این ویدیوی یوتیوب محدودیت سنی (+۱۸) دارد و بدون لاگین اکانت قابل دانلود نیست."
+    if "private video" in low or "members-only" in low or "join this channel" in low:
+        return "این ویدیوی یوتیوب خصوصی یا ویژه اعضا (Members-only) است."
+    if "is live" in low or "live event will begin" in low or "premieres in" in low:
+        return "پخش زنده (Live) یا پریمیر فعال در یوتیوب قابل دانلود مستقیم نیست."
+    if "video unavailable" in low or "has been removed" in low or "account associated" in low:
+        return "این ویدیو در یوتیوب در دسترس نیست یا حذف شده است."
+    if "not available in your country" in low or "geo" in low and "blocked" in low:
+        return "این ویدیو در منطقه جغرافیایی سرور توسط صاحب اثر محدود شده است."
+    if "sign in to confirm you’re not a bot" in low or "not a bot" in low:
+        return "یوتیوب موقتاً درخواست سرور را محدود کرده است؛ کمی بعد دوباره تلاش کنید."
+    return "دریافت این ویدیو از یوتیوب ممکن نشد."
+
+
 @dataclass(frozen=True)
 class YoutubeInfo:
     video_id: str
@@ -137,8 +155,9 @@ def download_youtube_media(video_id: str, fmt_key: str) -> Iterator[tuple[str, s
         yield chosen_file, title, media_type
     except DownloadError as exc:
         msg = str(exc)
+        log.warning("yt-dlp DownloadError for %s (%s): %s", video_id, fmt_key, msg)
         if "larger than maximum file size" in msg.lower() or "filesize" in msg.lower():
             raise YoutubeOversizedError("حجم این مدیا بالاتر از ۵۰ مگابایت (سقف تلگرام) است.") from exc
-        raise YoutubeError(f"خطا در دانلود از یوتیوب: {exc}") from exc
+        raise YoutubeError(_friendly_youtube_error(msg)) from exc
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

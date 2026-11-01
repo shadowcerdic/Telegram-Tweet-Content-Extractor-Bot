@@ -16,7 +16,9 @@ class InstagramCollect(unittest.TestCase):
                 (Path(tmp) / f"CODE_{n}.jpg").write_bytes(b"x")
             (Path(tmp) / "CODE_4.mp4").write_bytes(b"x")
             (Path(tmp) / "CODE.json").write_bytes(b"x")  # ignored
-            names = [Path(i.source).name for i in collect_media(Path(tmp))]
+            items, oversized = collect_media(Path(tmp))
+            names = [Path(i.source).name for i in items]
+        self.assertEqual(oversized, 0)
         self.assertEqual(
             names,
             ["CODE_1.jpg", "CODE_2.jpg", "CODE_3.jpg", "CODE_4.mp4", "CODE_10.jpg", "CODE_11.jpg"],
@@ -27,7 +29,9 @@ class InstagramCollect(unittest.TestCase):
         with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
             (Path(a) / "ABC.jpg").write_bytes(b"x")
             (Path(b) / "ABCdef.jpg").write_bytes(b"x")
-            self.assertEqual(len(collect_media(Path(a))), 1)
+            items, oversized = collect_media(Path(a))
+            self.assertEqual(len(items), 1)
+            self.assertEqual(oversized, 0)
 
     def test_webp_image_is_converted_and_collected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -39,12 +43,123 @@ class InstagramCollect(unittest.TestCase):
                 capture_output=True,
                 check=True,
             )
-            items = collect_media(Path(tmp))
+            items, oversized = collect_media(Path(tmp))
+            self.assertEqual(oversized, 0)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0].kind, "photo")
             self.assertTrue(items[0].source.endswith(".jpg"))
             self.assertFalse(webp.exists())
             self.assertTrue(Path(items[0].source).exists())
+
+    def test_oversized_instagram_file_is_filtered_and_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "CODE_1.jpg").write_bytes(b"123")
+            (Path(tmp) / "CODE_2.mp4").write_bytes(b"x" * 200)
+            items, oversized = collect_media(Path(tmp), max_bytes=100)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].kind, "photo")
+            self.assertEqual(oversized, 1)
+
+    def test_downloaded_instagram_media_raises_when_all_oversized(self):
+        import instagram_client
+
+        def fake_dl(_code, workdir):
+            workdir.mkdir(parents=True, exist_ok=True)
+            (workdir / "BIG.mp4").write_bytes(b"x" * 200)
+            return "cap"
+
+        with mock.patch.object(instagram_client, "_download", side_effect=fake_dl), \
+             mock.patch.object(
+                 instagram_client,
+                 "collect_media",
+                 side_effect=lambda d: collect_media(d, max_bytes=100),
+             ):
+            with self.assertRaises(instagram_client.MediaFetchError) as cm:
+                with instagram_client.downloaded_instagram_media("CODE"):
+                    pass
+        self.assertIn("۵۰ مگابایت", str(cm.exception))
+
+
+class InstagramFailureDiagnosis(unittest.TestCase):
+    def test_age_restricted_ruling_returns_18_plus_message(self):
+        from instagram_client import _diagnose_metadata_failure
+
+        ctx = mock.Mock(is_logged_in=False)
+        ctx.doc_id_graphql_query.return_value = {
+            "data": {
+                "xig_polaris_media": {
+                    "gating_ruling": {
+                        "gating_type": 3,
+                        "title": "Age-restricted content",
+                        "description": "This content is age-restricted based on your age or account settings.",
+                    }
+                }
+            }
+        }
+        msg = _diagnose_metadata_failure(ctx, "DfHKkl3h_7h")
+        assert msg is not None
+        self.assertIn("+۱۸", msg)
+        self.assertIn("محدودیت سنی", msg)
+
+    def test_missing_or_private_polaris_null_returns_not_found(self):
+        from instagram_client import _diagnose_metadata_failure
+
+        ctx = mock.Mock(is_logged_in=False)
+        ctx.doc_id_graphql_query.return_value = {"data": {"xig_polaris_media": None}}
+        msg = _diagnose_metadata_failure(ctx, "AAAAAAAAAAA")
+        assert msg is not None
+        self.assertIn("یافت نشد", msg)
+
+    def test_long_private_shortcode_is_identified_without_network(self):
+        from instagram_client import _diagnose_metadata_failure
+
+        ctx = mock.Mock(is_logged_in=False)
+        msg = _diagnose_metadata_failure(ctx, "A" * 39)
+        assert msg is not None
+        self.assertIn("خصوصی", msg)
+        ctx.doc_id_graphql_query.assert_not_called()
+
+    def test_other_gating_ruling_includes_title(self):
+        from instagram_client import _diagnose_metadata_failure
+
+        ctx = mock.Mock(is_logged_in=False)
+        ctx.doc_id_graphql_query.return_value = {
+            "data": {
+                "xig_polaris_media": {
+                    "gating_ruling": {
+                        "gating_type": 2,
+                        "title": "Restricted in your region",
+                        "description": "Unavailable.",
+                    }
+                }
+            }
+        }
+        msg = _diagnose_metadata_failure(ctx, "DfHKkl3h_7h")
+        assert msg is not None
+        self.assertIn("Restricted in your region", msg)
+
+    def test_download_surfaces_age_restricted_error(self):
+        import instaloader
+        import instagram_client
+
+        fake_loader = mock.Mock()
+        fake_loader.context.is_logged_in = False
+        fake_loader.context.doc_id_graphql_query.return_value = {
+            "data": {
+                "xig_polaris_media": {
+                    "gating_ruling": {"title": "Age-restricted content", "description": "age"}
+                }
+            }
+        }
+        with mock.patch.object(instagram_client, "_get_loader", return_value=fake_loader), \
+             mock.patch.object(
+                 instaloader.Post,
+                 "from_shortcode",
+                 side_effect=instaloader.exceptions.BadResponseException("Fetching Post metadata failed."),
+             ):
+            with self.assertRaises(instagram_client.MediaFetchError) as cm:
+                instagram_client._download("DfHKkl3h_7h", Path("/tmp/unused"))
+        self.assertIn("محدودیت سنی", str(cm.exception))
 
 
 def resp(status=200, payload=None):
