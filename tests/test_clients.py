@@ -36,13 +36,9 @@ class InstagramCollect(unittest.TestCase):
     def test_webp_image_is_converted_and_collected(self):
         with tempfile.TemporaryDirectory() as tmp:
             webp = Path(tmp) / "CODE_1.webp"
-            # generate real minimal webp so ffmpeg can convert it
-            import subprocess
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=10x10:d=1", "-vframes", "1", str(webp)],
-                capture_output=True,
-                check=True,
-            )
+            # generate a real webp with Pillow (no external binary needed)
+            from PIL import Image
+            Image.new("RGB", (10, 10), "blue").save(webp, "WEBP")
             items, oversized = collect_media(Path(tmp))
             self.assertEqual(oversized, 0)
             self.assertEqual(len(items), 1)
@@ -50,6 +46,21 @@ class InstagramCollect(unittest.TestCase):
             self.assertTrue(items[0].source.endswith(".jpg"))
             self.assertFalse(webp.exists())
             self.assertTrue(Path(items[0].source).exists())
+
+    def test_transparent_webp_converts_without_ffmpeg_on_path(self):
+        import os
+        from unittest import mock
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            webp = Path(tmp) / "CODE_1.webp"
+            Image.new("RGBA", (10, 10), (255, 0, 0, 0)).save(webp, "WEBP")
+            with mock.patch.dict(os.environ, {"PATH": "/nonexistent"}):
+                items, _ = collect_media(Path(tmp))
+            self.assertEqual(len(items), 1)
+            self.assertTrue(items[0].source.endswith(".jpg"))
+            with Image.open(items[0].source) as im:
+                self.assertEqual(im.format, "JPEG")
+                self.assertEqual(im.getpixel((0, 0)), (255, 255, 255))
 
     def test_oversized_instagram_file_is_filtered_and_counted(self):
         with tempfile.TemporaryDirectory() as tmp:

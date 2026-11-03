@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import re
 import shutil
-import subprocess
 import threading
 import uuid
 from contextlib import contextmanager
@@ -71,24 +70,35 @@ def _natural_key(path: Path) -> list[Any]:
 
 
 def _convert_webp_to_jpeg(path: Path) -> Path:
-    """Convert a .webp image to .jpg using ffmpeg and remove the original."""
+    """Convert a .webp image to .jpg in-process (Pillow) and remove the original.
+
+    Pure Python on purpose: no external binary, so it works inside the
+    sandboxed systemd unit (ProtectHome hides /root-based symlinks).
+    """
     target = path.with_suffix(".jpg")
     # If the target filename already exists, make it unique
     if target.exists():
         target = path.with_name(f"{path.stem}_{uuid.uuid4().hex[:6]}.jpg")
     try:
-        res = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(path), "-q:v", "2", str(target)],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        if res.returncode == 0 and target.exists() and target.stat().st_size > 0:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img.seek(0)  # animated webp -> first frame
+            if img.mode in ("RGBA", "LA", "P"):
+                rgba = img.convert("RGBA")
+                flat = Image.new("RGB", rgba.size, (255, 255, 255))
+                flat.paste(rgba, mask=rgba.getchannel("A"))
+                out = flat
+            else:
+                out = img.convert("RGB")
+            out.save(target, "JPEG", quality=92)
+        if target.exists() and target.stat().st_size > 0:
             path.unlink(missing_ok=True)
             return target
-        log.warning("ffmpeg webp conversion failed for %s (exit %s): %s", path.name, res.returncode, res.stderr.decode(errors="ignore")[:200])
+        log.warning("webp conversion produced an empty file for %s", path.name)
     except Exception as exc:  # noqa: BLE001
         log.warning("webp conversion error for %s: %s", path.name, exc)
+        target.unlink(missing_ok=True)
     return path
 
 
