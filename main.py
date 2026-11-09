@@ -27,14 +27,17 @@ from downloader import download_media
 from helpers import (
     build_quote_section,
     build_reply_text,
+    build_thread_text,
     chunk_media_items,
     chunk_text,
     extract_instagram_shortcodes,
     extract_tweet_ids,
     extract_youtube_ids,
+    fa_number,
     load_last_update_id,
     quote_author_label,
     save_last_update_id,
+    unavailable_label,
 )
 from instagram_client import MediaFetchError, downloaded_instagram_media, purge_temp_dir
 from models import MediaItem
@@ -51,7 +54,7 @@ from telegram_api import (
     send_media_group,
     send_message,
 )
-from x_client import get_tweet_payload
+from x_client import TweetPayload, ThreadResult, get_thread_result, get_tweet_payload
 from youtube_client import (
     YoutubeError,
     YoutubeOversizedError,
@@ -216,6 +219,7 @@ def deliver(
     text: str | None,
     extra_items: list[MediaItem] | None = None,
     extra_caption: str | None = None,
+    trailing_caption: str | None = None,
 ) -> None:
     """Send ``items`` with ``text``.
 
@@ -227,6 +231,10 @@ def deliver(
     chunk, so it is always obvious which file came from which tweet. When the
     outer tweet has no media of its own, the full text rides on the first quote
     chunk instead — same single-message feel as Twitter.
+
+    ``trailing_caption`` labels the LAST media chunk when the text could not ride
+    as a caption (a thread body is far over the caption limit). Left at None, every
+    existing caller behaves exactly as before.
     """
     text = (text or "").strip()
     items = list(items or [])
@@ -244,12 +252,11 @@ def deliver(
         reply_to_original = False
 
     pending_extra_caption = extra_caption
-    force_local = False
-    for chunk, is_quote in [
-        (c, False) for c in chunk_media_items(items)
-    ] + [
+    chunks = [(c, False) for c in chunk_media_items(items)] + [
         (c, True) for c in chunk_media_items(extra_items)
-    ]:
+    ]
+    force_local = False
+    for position, (chunk, is_quote) in enumerate(chunks):
         if not is_quote:
             caption, text_caption = text_caption, None
         else:
@@ -258,6 +265,8 @@ def deliver(
                 None,
                 None,
             )
+        if caption is None and trailing_caption and position == len(chunks) - 1:
+            caption = trailing_caption
         force_local = send_chunk(
             ctx, chunk, caption=caption, reply=reply_to_original, force_local=force_local
         )
@@ -296,8 +305,125 @@ def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = froze
         status.error("❌ خطا در پردازش لینک اینستاگرام.")
 
 
-def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()) -> None:
-    """Deliver a tweet, and the post it quotes (quote tweet) as a Twitter-style card."""
+def _thread_caption(thread: ThreadResult) -> str:
+    """Short byline for the first album (Telegram caps captions at 1024 chars)."""
+    from_ = _thread_author_name(thread)
+    if thread.total > len(thread.items):
+        label = f"🧵 ترد {fa_number(len(thread.items))} از {fa_number(thread.total)} توییت"
+    else:
+        label = f"🧵 ترد {fa_number(len(thread.items))} توییت"
+    return f"{label} — @{from_}" if from_ else label
+
+
+def _thread_author_name(thread: ThreadResult) -> str:
+    for item in thread.items:
+        if item.payload is None:
+            continue
+        author = item.payload.tweet.get("author")
+        if isinstance(author, dict) and (author.get("screen_name") or "").strip():
+            return str(author["screen_name"]).strip()
+    return ""
+
+
+def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: TweetPayload) -> bool:
+    """Deliver a whole thread. Returns False when there is nothing to deliver.
+
+    Layout chosen for this feature: one continuous text message (chunked by
+    ``deliver``/``chunk_text`` when it is long), then every media file of the
+    delivered slice as albums. The full thread text is almost always over the
+    1024-char caption limit, so the albums wear a short byline instead of the
+    body — that is a visible difference from the single-tweet path, where the
+    text rides as the caption.
+    """
+    text = build_thread_text(thread)
+    if not text:
+        return False
+
+    items = list(thread.media_items())
+    notes: list[str] = []
+
+    # A quoted post inside the thread travels as EXTRA media with its own 📎 label,
+    # exactly like the single-tweet path, so it can never be mistaken for the
+    # thread's own files. The focal item is skipped in the loop: its payload was
+    # fetched separately and is handled below with the same 📎 treatment.
+    focal_id = thread.requested_id
+    extra_items: list[MediaItem] = []
+    extra_caption: str | None = None
+    for item in thread.items:
+        if item.payload is None or item.item_id == focal_id:
+            continue
+        quote = item.payload.quote
+        if quote is not None:
+            extra_items.extend(quote.media_items())
+            if extra_caption is None:
+                extra_caption = (
+                    f"📎 پیوست توییت نقل‌قول‌شده — {quote_author_label(quote.tweet)}"
+                )
+            notes += [
+                _oversized_note(ov.get("url", ""), f"ویدیوی توییت {fa_number(item.item_id)} نقل‌قول‌شده")
+                for ov in quote.oversized_videos
+            ]
+        notes += [
+            _oversized_note(ov.get("url", ""), f"ویدیوی توییت {item.item_id}")
+            for ov in item.payload.oversized_videos
+        ]
+
+    # The focal tweet, wherever its link pointed inside the chain: as a thread item
+    # when it is inside the delivered slice, else from the separately fetched payload
+    # (the same post, never a different one).
+    focal_payload = next(
+        (i.payload for i in thread.items if i.item_id == focal_id and i.payload is not None),
+        None,
+    ) or payload
+    if focal_payload.quote is not None:
+        extra_items = list(focal_payload.quote.media_items()) + extra_items
+        if extra_caption is None:
+            extra_caption = (
+                f"📎 پیوست توییت نقل‌قول‌شده — "
+                f"{quote_author_label(focal_payload.quote.tweet)}"
+            )
+        notes += [
+            _oversized_note(ov.get("url", ""), "ویدیوی توییت نقل‌قول‌شده")
+            for ov in focal_payload.quote.oversized_videos
+        ]
+    notes += [
+        _oversized_note(ov.get("url", ""), "ویدیو") for ov in focal_payload.oversized_videos
+    ]
+    if notes:
+        text = (text + "\n\n" + "\n".join(notes)).strip()
+
+    if not items and not extra_items:
+        send_text(ctx, text)
+        status.finish()
+        return True
+
+    status.update("📤 در حال ارسال به تلگرام...")
+    # deliver() spends the text as a caption when it fits and as message(s) when it
+    # does not. When the body had to go out as messages, the last media chunk wears
+    # the short thread byline instead, so the albums are still labelled.
+    deliver(
+        ctx, items, text,
+        extra_items=extra_items,
+        extra_caption=extra_caption,
+        trailing_caption=None if len(text) <= CAPTION_LIMIT else _thread_caption(thread),
+    )
+    status.finish()
+    return True
+
+
+def handle_tweet(
+    ctx: Ctx,
+    tweet_id: str,
+    siblings: frozenset[str] = frozenset(),
+    delivered_roots: set[str] | None = None,
+) -> None:
+    """Deliver a tweet: the whole thread it belongs to when it is part of one.
+
+    The single-tweet fetch still runs first and its answer is the plain failure
+    message the user expects when the post is gone. The thread probe only replaces
+    that delivery when FxTwitter reports a chain of two or more tweets, so a lone
+    tweet is served byte-for-byte as before.
+    """
     status = Status(ctx, "⏳ در حال بررسی لینک X...")
     try:
         status.update("📥 در حال دریافت محتوای توییت...")
@@ -308,6 +434,33 @@ def handle_tweet(ctx: Ctx, tweet_id: str, siblings: frozenset[str] = frozenset()
             log.info("Tweet %s: fetch returned nothing", tweet_id)
             status.error("❌ دریافت این توییت ممکن نشد (حذف شده یا حساب خصوصی است).")
             return
+
+        thread = get_thread_result(tweet_id, translate_to=TRANSLATE_TO or None)
+        if thread is not None:
+            root_id = thread.root.item_id or thread.requested_id
+            if delivered_roots is not None and root_id in delivered_roots:
+                # Another link in this same message already delivered this thread;
+                # posting it twice would be noise, not completeness.
+                log.info(
+                    "Tweet %s: thread root %s already delivered from this message; "
+                    "skipping the whole-thread copy",
+                    tweet_id,
+                    root_id,
+                )
+            elif _deliver_thread(ctx, status, thread, payload):
+                if delivered_roots is not None:
+                    delivered_roots.add(root_id)
+                log.info(
+                    "Tweet %s: thread delivered items=%s total=%s truncated=%s media=%s "
+                    "translated=%s",
+                    tweet_id,
+                    len(thread.items),
+                    thread.total,
+                    thread.truncated,
+                    len(thread.media_items()),
+                    bool((thread.focal.tweet.get("translation") or {}).get("text")),
+                )
+                return
 
         # Translation gaps (transient AND the deterministic per-language ones) are
         # recovered inside x_client._ensure_translation, for this tweet and for a
@@ -517,7 +670,11 @@ def process_message(message: dict[str, Any]) -> None:
     # already being delivered on its own instead of posting it a second time.
     siblings = frozenset(tweet_ids)
 
-    jobs: list[tuple[Callable[[Ctx, str, frozenset[str]], None], str]] = [
+    # Thread roots already delivered by this message: several links from one
+    # thread must not paste the same thread once per link.
+    delivered_roots: set[str] = set()
+
+    jobs: list[tuple[Callable[..., None], str]] = [
         (handle_instagram, code) for code in extract_instagram_shortcodes(text)
     ] + [
         (handle_tweet, tweet_id) for tweet_id in tweet_ids
@@ -526,7 +683,10 @@ def process_message(message: dict[str, Any]) -> None:
     ]
 
     for handler, link_id in jobs[:MAX_LINKS_PER_MESSAGE]:
-        handler(ctx, link_id, siblings)
+        if handler is handle_tweet:
+            handler(ctx, link_id, siblings, delivered_roots=delivered_roots)
+        else:
+            handler(ctx, link_id, siblings)
 
 
 def process_update(update: dict[str, Any]) -> None:

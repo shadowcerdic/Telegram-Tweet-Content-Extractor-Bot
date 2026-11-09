@@ -64,6 +64,27 @@ TRANSLATE_REFETCH_TRIES_NOTE = int(os.getenv("TRANSLATE_REFETCH_TRIES_NOTE", "2"
 # Seconds of exponential wait before each retry (0 disables it).
 TRANSLATE_REFETCH_BACKOFF_S = float(os.getenv("TRANSLATE_REFETCH_BACKOFF_S", "0.4"))
 
+# --- X threads (a tweet that is part of a self-reply chain) -------------------
+# FxTwitter exposes the whole chain at GET /2/thread/{id}, from any link inside
+# it. Delivering an unbounded thread would flood a chat, so the number of items
+# rendered is capped; the rest is announced with a link to the continuation.
+THREAD_MAX_TWEETS = int(os.getenv("THREAD_MAX_TWEETS", "20"))
+# A thread probe doubles as a translation source: /2/thread/{id}?lang=xx returns
+# inline ``translation`` for items X could translate. When the focal tweet came
+# back without one, the (id, lang) pair is often flaky rather than dead, so a
+# thread item that still has no translation gets this many plain refetches
+# before the keyless fallback — fewer than a lone tweet gets, because the cost
+# multiplies by the thread length.
+THREAD_TRANSLATE_REFETCH_TRIES = int(os.getenv("THREAD_TRANSLATE_REFETCH_TRIES", "1"))
+# Wall-clock budget for ONE thread delivery. Every upstream call carries its own
+# REQUEST_TIMEOUT, so a thread whose items all need a translation retry could
+# otherwise burn tens of them: 20 items x 2 tries x 30s is not a download, it is a
+# hang. When the budget runs out the thread is cut short and announced.
+THREAD_TIME_BUDGET_S = float(os.getenv("THREAD_TIME_BUDGET_S", "60"))
+# Kill switch: "off" restores the pre-thread behaviour (focal tweet only) without
+# a deploy, in case the thread endpoint starts misbehaving upstream.
+THREAD_FETCH = os.getenv("THREAD_FETCH", "on").strip().lower()
+
 # YouTube downloader proxy (Cloudflare WARP default on VPS to avoid datacenter IP bot detection)
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "socks5://127.0.0.1:40000").strip()
 

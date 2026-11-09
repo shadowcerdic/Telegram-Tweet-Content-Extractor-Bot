@@ -16,3 +16,4 @@ venv/
 
 # deploy backups
 *.bak*
+backup-thread-20261109/

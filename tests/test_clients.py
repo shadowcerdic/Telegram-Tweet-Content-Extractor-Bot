@@ -5,6 +5,8 @@ from unittest import mock
 
 import requests
 
+import constants
+import helpers
 import x_client
 from instagram_client import collect_media
 
@@ -343,6 +345,299 @@ class XClientQuote(unittest.TestCase):
             result = _fetched("1")
         self.assertIsNone(result.quote)
         self.assertIsNone(result.quote_unavailable)
+
+
+def _thread_item(item_id: str, text: str, *, lang: str = "fa", author: str = "a", **extra) -> dict:
+    """One item of a /2/thread response: same shape as a v1 tweet plus ``type``."""
+    return {
+        "type": "status",
+        "id": item_id,
+        "text": text,
+        "lang": lang,
+        "url": f"https://x.com/{author}/status/{item_id}",
+        "author": {"name": author.upper(), "screen_name": author, "url": f"https://x.com/{author}"},
+        "media": extra.pop("media", {}),
+        **extra,
+    }
+
+
+def _thread_envelope(items, focal="auto"):
+    # focal: dict | None  ("auto" takes the first item, what the API really returns)
+    """A /2/thread envelope: the focal status is the tweet that was asked for."""
+    if focal == "auto":
+        focal = items[0] if items else None
+    return {"code": 200, "thread": items, "status": focal}
+
+
+class ThreadFetch(unittest.TestCase):
+    """GET /2/thread/{id} resolves any link inside a self-reply chain, root first.
+
+    Measured live on 2026-11-09 with id 2119728555940843648: 7 items, root first,
+    also from a mid-thread link; a plain tweet returns a one-item thread, which is
+    what makes the probe safe to run on every tweet.
+    """
+
+    def setUp(self):
+        # The thread knobs are read at call time from `constants`, so an operator
+        # running the suite with THREAD_FETCH=off or a small THREAD_MAX_TWEETS in
+        # the environment must not turn these tests red.
+        for name, value in (
+            ("THREAD_FETCH", "on"),
+            ("THREAD_MAX_TWEETS", 20),  # the shipped default, whatever the env says
+            ("THREAD_TRANSLATE_REFETCH_TRIES", 1),
+        ):
+            patcher = mock.patch.object(constants, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _thread(self, tweet_id, translate_to=None, **kw):
+        return x_client.get_thread_result(tweet_id, translate_to=translate_to, **kw)
+
+    def test_chain_returns_every_item_root_first_with_media(self):
+        video = {
+            "duration": 100.0,
+            "url": "https://v/hq.mp4",
+            "formats": [
+                {"url": "https://v/lo.mp4", "bitrate": 200_000, "container": "mp4"},
+                {"url": "https://v/hq.mp4", "bitrate": 25_000_000, "container": "mp4"},
+            ],
+        }
+        items = [
+            _thread_item("10", "اول", media={"photos": [{"url": "https://p/1.jpg"}]}),
+            _thread_item("11", "دوم", replying_to="a", media={"videos": [video]}),
+            _thread_item("12", "سوم", replying_to="a"),
+        ]
+        with mock.patch.object(
+            x_client._session, "get",
+            return_value=resp(200, _thread_envelope(items, focal=items[1])),
+        ) as get, mock.patch.object(x_client.translator, "translate") as fb:
+            thread = self._thread("11")
+        assert thread is not None
+        self.assertEqual(get.call_args.args[0], "https://api.fxtwitter.com/2/thread/11")
+        # A mid-thread link: items still come back from the root, and the tweet the
+        # user actually sent is known separately, so the renderer can mark it.
+        self.assertEqual([i.item_id for i in thread.items], ["10", "11", "12"])
+        self.assertEqual(thread.requested_id, "11")
+        self.assertEqual(thread.root.item_id, "10")
+        self.assertEqual(thread.total, 3)
+        self.assertEqual(thread.truncated, 0)
+        # The 50 MB picker runs on thread items exactly as on a quoted post.
+        self.assertEqual(thread.items[0].payload.photos, ["https://p/1.jpg"])
+        self.assertEqual(thread.items[1].payload.videos, ["https://v/lo.mp4"])
+        self.assertEqual(
+            [(i.kind, i.source) for i in thread.media_items()],
+            [("photo", "https://p/1.jpg"), ("video", "https://v/lo.mp4")],
+        )
+        fb.assert_not_called()  # source is already the target language
+
+    def test_plain_tweet_is_no_thread(self):
+        items = [_thread_item("10", "تک توییت")]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ):
+            self.assertIsNone(self._thread("10"))
+
+    def test_deleted_item_stays_a_labeled_hole(self):
+        items = [
+            _thread_item("10", "اول"),
+            {"type": "tombstone", "provider": "twitter", "reason": "deleted"},
+            _thread_item("12", "سوم"),
+        ]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ):
+            thread = self._thread("10")
+        assert thread is not None
+        self.assertEqual([i.is_unavailable for i in thread.items], [False, True, False])
+        self.assertEqual(thread.items[1].unavailable, "deleted")
+        self.assertEqual(thread.total, 3)
+
+    def test_cap_keeps_the_first_dropped_item_for_the_continuation_link(self):
+        items = [_thread_item(str(i), f"توییت {i}") for i in range(1, 6)]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ):
+            thread = self._thread("1", max_items=3)
+        assert thread is not None
+        self.assertEqual([i.item_id for i in thread.items], ["1", "2", "3"])
+        self.assertEqual((thread.total, thread.truncated), (5, 2))
+        # only the FIRST dropped item is kept: that is where "ادامه" must open
+        self.assertEqual([i.item_id for i in thread.dropped], ["4"])
+        self.assertEqual(thread.dropped[0].author_screen_name, "a")
+
+    def test_time_budget_cuts_the_thread_and_still_announces_the_rest(self):
+        """A slow upstream must not turn a thread into an open-ended hang."""
+        import time as time_module
+
+        items = [_thread_item(str(i), f"توییت {i}") for i in range(1, 6)]
+        # A clock that spends 10s per item: with a 25s budget two items fit and the
+        # third is exactly where the delivery gets cut.
+        readings = {"n": 0}
+
+        def fake_monotonic():
+            readings["n"] += 1
+            return 10.0 * readings["n"]
+
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ), mock.patch.object(constants, "THREAD_TIME_BUDGET_S", 25.0), mock.patch.object(
+            x_client, "THREAD_TIME_BUDGET_S", 25.0
+        ), mock.patch.object(
+            time_module, "monotonic", fake_monotonic
+        ):
+            thread = self._thread("1")
+        assert thread is not None
+        self.assertEqual([i.item_id for i in thread.items], ["1", "2"])
+        self.assertEqual((thread.total, thread.truncated), (5, 3))
+        self.assertEqual([i.item_id for i in thread.dropped], ["3"])
+        # the reader is told how much is missing and where to pick it up
+        text = helpers.build_thread_text(thread)
+        assert text is not None
+        self.assertIn("۳ توییت دیگر", text)
+        self.assertIn("https://x.com/a/status/3", text)
+        self.assertIn("🧵 ترد ۲ از ۵ توییت", text)
+
+    def test_items_in_the_response_are_used_without_a_second_call(self):
+        items = [
+            _thread_item("10", "hello", lang="en", translation={"text": "سلام", "provider": "bing"}),
+            _thread_item("11", "world", lang="en", translation={"text": "دنیا", "provider": "bing"}),
+        ]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ) as get, mock.patch.object(x_client.translator, "translate") as fb:
+            thread = self._thread("10", "fa")
+        assert thread is not None
+        self.assertEqual(get.call_count, 1)
+        fb.assert_not_called()
+        self.assertEqual(
+            [i.payload.tweet["translation"]["text"] for i in thread.items], ["سلام", "دنیا"]
+        )
+
+    def test_echo_is_scrubbed_and_the_item_is_recovered(self):
+        """X can answer ``translation.text`` == the source; that is not a translation."""
+        items = [
+            _thread_item("10", "hello", lang="en", translation={"text": "hello", "provider": "grok"}),
+            _thread_item("11", "world", lang="en"),
+        ]
+        recovered = [
+            _envelope(_tweet(id="10", text="hello", lang="en", translation={"text": "سلام"})),
+            _envelope(_tweet(id="11", text="world", lang="en", translation={"text": "دنیا"})),
+        ]
+        with mock.patch.object(
+            x_client._session, "get",
+            side_effect=[resp(200, _thread_envelope(items)), resp(200, recovered[0]),
+                         resp(200, recovered[1])],
+        ) as get, mock.patch.object(x_client.translator, "translate") as fb, \
+             mock.patch.object(x_client.time, "sleep"):
+            thread = self._thread("10", "fa")
+        assert thread is not None
+        urls = [c.args[0] for c in get.call_args_list]
+        # The echoed item is scrubbed BEFORE the retry, so a "translation" that is
+        # just the source text cannot make the recovery logic stand down.
+        self.assertEqual(urls[1], "https://api.fxtwitter.com/i/status/10/fa")
+        self.assertEqual(
+            [i.payload.tweet["translation"]["text"] for i in thread.items], ["سلام", "دنیا"]
+        )
+        fb.assert_not_called()
+
+    def test_untranslated_item_falls_back_per_item(self):
+        items = [
+            _thread_item("10", "hello", lang="en"),
+            _thread_item("11", "world", lang="en"),
+        ]
+        answered = {
+            "10": _envelope(_tweet(id="10", text="hello", lang="en", translation={"text": "سلام"})),
+            "11": _envelope(_tweet(id="11", text="world", lang="en", translation={"text": "دنیا"})),
+        }
+        with mock.patch.object(
+            x_client._session, "get",
+            side_effect=[
+                resp(200, _thread_envelope(items)),
+                resp(200, answered["10"]),
+                resp(200, answered["11"]),
+            ],
+        ) as get, mock.patch.object(x_client.translator, "translate") as fb, \
+             mock.patch.object(x_client.time, "sleep"):
+            thread = self._thread("10", "fa")
+        assert thread is not None
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertEqual(urls[0], "https://api.fxtwitter.com/2/thread/10?lang=fa")
+        # Each missing item is recovered by ITS OWN translate endpoint. Refetching
+        # the thread per item would retranslate the whole chain to fix one line.
+        self.assertEqual(urls[1], "https://api.fxtwitter.com/i/status/10/fa")
+        self.assertEqual(urls[2], "https://api.fxtwitter.com/i/status/11/fa")
+        self.assertEqual(
+            [i.payload.tweet["translation"]["text"] for i in thread.items], ["سلام", "دنیا"]
+        )
+        fb.assert_not_called()
+
+    def test_focal_link_outside_the_cap_is_still_reported(self):
+        items = [_thread_item(str(i), f"توییت {i}") for i in range(1, 6)]
+        with mock.patch.object(
+            x_client._session, "get",
+            return_value=resp(200, _thread_envelope(items, focal=items[4])),
+        ):
+            thread = self._thread("5", max_items=2)
+        assert thread is not None
+        self.assertEqual([i.item_id for i in thread.items], ["1", "2"])
+        self.assertEqual(thread.requested_id, "5")
+        self.assertEqual(thread.focal.tweet["text"], "توییت 5")
+
+    def test_focal_quote_of_a_thread_item_is_parsed_once(self):
+        items = [
+            _thread_item("10", "اول"),
+            _thread_item("11", "دوم", quote=_thread_item("99", "نقل‌قول", media={"photos": [{"url": "https://q/1.jpg"}]})),
+        ]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ):
+            thread = self._thread("10")
+        assert thread is not None
+        quote = thread.items[1].payload.quote
+        assert quote is not None
+        self.assertEqual(quote.tweet["id"], "99")
+        self.assertIsNone(quote.quote)  # depth stays capped at 1
+
+    def test_self_quote_back_to_the_link_is_dropped(self):
+        items = [
+            _thread_item("10", "اول"),
+            _thread_item("11", "دوم", quote=_thread_item("11", "دوم")),
+        ]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ):
+            thread = self._thread("10")
+        assert thread is not None
+        self.assertIsNone(thread.items[1].payload.quote)
+
+    def test_kill_switch_restores_the_single_tweet_path(self):
+        with mock.patch.object(constants, "THREAD_FETCH", "off"), \
+             mock.patch.object(x_client._session, "get") as get:
+            self.assertIsNone(self._thread("10"))
+        get.assert_not_called()
+
+    def test_probe_failures_never_invent_a_thread(self):
+        for response in (resp(404), resp(200, {"code": 404, "message": "nope"}), resp(200, {})):
+            with mock.patch.object(x_client._session, "get", return_value=response):
+                self.assertIsNone(self._thread("10"))
+        with mock.patch.object(
+            x_client._session, "get", side_effect=requests.RequestException("down")
+        ):
+            self.assertIsNone(self._thread("10"))
+
+    def test_language_is_requested_once_on_the_thread_call(self):
+        items = [
+            _thread_item("10", "hello", lang="en", translation={"text": "سلام"}),
+            _thread_item("11", "world", lang="en", translation={"text": "دنیا"}),
+        ]
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _thread_envelope(items))
+        ) as get, mock.patch.object(x_client.translator, "translate") as fb:
+            self._thread("10", "fa")
+        self.assertEqual(get.call_args_list[0].args[0], "https://api.fxtwitter.com/2/thread/10?lang=fa")
+        # One call total: the response carried every item, so nothing is refetched.
+        self.assertEqual(get.call_count, 1)
+        fb.assert_not_called()
 
 
 class TranslationFallback(unittest.TestCase):

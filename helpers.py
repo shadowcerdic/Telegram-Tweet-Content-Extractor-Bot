@@ -140,6 +140,151 @@ def build_quote_section(
     return "\n\n" + "\n".join(parts)
 
 
+PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
+THREAD_ITEM_SEPARATOR = "┄" * 20
+_UNAVAILABLE_LABELS = {
+    "deleted": "حذف شده",
+    "suspended": "حساب معلق است",
+    "private": "حساب خصوصی است",
+    "blocked": "حساب مسدود است",
+    "unavailable": "در دسترس نیست",
+}
+
+
+def fa_number(value: Any) -> str:
+    """ASCII digits -> Persian digits, so counters read as Persian text."""
+    text = str(value)
+    return "".join(PERSIAN_DIGITS[int(ch)] if ch.isdigit() and int(ch) <= 9 else ch for ch in text)
+
+
+def unavailable_label(reason: str | None) -> str:
+    """A Persian explanation for an X tombstone reason, falling back to the raw one."""
+    key = (reason or "").strip().lower()
+    if not key:
+        return "در دسترس نیست"
+    return _UNAVAILABLE_LABELS.get(key, f"در دسترس نیست ({key})")
+
+
+def _thread_item_body(item: Any, index: int, total: int, focal_id: str | None) -> str:
+    """One thread position: counter, text (+translation), optional quote card, link."""
+    counter = f"{THREAD_ITEM_SEPARATOR}\n{fa_number(index)}/{fa_number(total)}"
+    if focal_id and str(getattr(item, "item_id", "") or "") == str(focal_id):
+        counter += " 👈 توییتی که فرستادید"
+
+    payload = getattr(item, "payload", None)
+    if payload is None:
+        return f"{counter}\n\n❌ توییت {unavailable_label(getattr(item, 'unavailable', None))}."
+
+    tweet = payload.tweet if isinstance(payload.tweet, dict) else {}
+    body = _tweet_body(tweet)
+    if not body:
+        # A media-only item still has a position in the chain; saying so keeps the
+        # counters honest instead of letting a gap look like a lost tweet.
+        body = "📎 (بدون متن — پیوست‌ها در ادامه ارسال می‌شوند)"
+    parts = [counter, "", body]
+
+    quote_tweet = getattr(payload, "quote", None)
+    unavailable = getattr(payload, "quote_unavailable", None)
+    quote_section = build_quote_section(
+        quote_tweet.tweet if quote_tweet is not None else None, unavailable
+    )
+    if quote_section:
+        parts.append(quote_section)
+
+    url = (tweet.get("url") or "").strip()
+    if url:
+        parts += ["", f"🔗 {url}"]
+    return "\n".join(parts)
+
+
+def _thread_root_url(result: Any) -> str:
+    """The link a reader needs to open to reach the rest of the thread."""
+    for candidate in (getattr(result, "root", None), *(getattr(result, "items", None) or [])):
+        payload = getattr(candidate, "payload", None)
+        if payload is None:
+            continue
+        url = (payload.tweet.get("url") or "").strip() if isinstance(payload.tweet, dict) else ""
+        if url:
+            return url
+    return ""
+
+
+def _thread_continuation_url(result: Any) -> str:
+    """Open-where-we-stopped link for a truncated thread.
+
+    The root link only shows the reader the part they already got, so the note
+    points at the first item the cap dropped. A dropped item carries no payload
+    (only its id and author), so build the link from those and fall back to root.
+    """
+    for item in list(getattr(result, "dropped", None) or []):
+        payload = getattr(item, "payload", None)
+        if payload is not None and isinstance(payload.tweet, dict):
+            url = (payload.tweet.get("url") or "").strip()
+            if url:
+                return url
+            author = payload.tweet.get("author")
+            if isinstance(author, dict):
+                handle = (author.get("screen_name") or "").strip()
+            else:
+                handle = ""
+        else:
+            handle = (getattr(item, "author_screen_name", "") or "").strip()
+        if handle and getattr(item, "item_id", ""):
+            return f"https://x.com/{handle}/status/{item.item_id}"
+    return _thread_root_url(result)
+
+
+def build_thread_text(result: Any) -> str | None:
+    """Render a whole thread as one continuous Persian message.
+
+    ``result`` is an :class:`x_client.ThreadResult`. Items keep their chain
+    position (a deleted tweet is labelled, not dropped), each carries its own
+    link, and the message ends with a byline plus a continuation note when the
+    thread was longer than the cap or the linked tweet fell outside the delivered
+    slice. Returns None when there is nothing renderable.
+    """
+    items = list(getattr(result, "items", None) or [])
+    if not items:
+        return None
+
+    focal_id = str(getattr(result, "requested_id", "") or "")
+    shown = len(items)
+    total = max(int(getattr(result, "total", 0) or 0), shown)
+
+    blocks = [
+        _thread_item_body(item, index, shown, focal_id)
+        for index, item in enumerate(items, start=1)
+    ]
+
+    author = ""
+    first = items[0]
+    if first.payload is not None and isinstance(first.payload.tweet.get("author"), dict):
+        author = (first.payload.tweet["author"].get("screen_name") or "").strip()
+
+    # "۲ توییت از ۵ توییت" reads like a machine join; "۲ از ۵ توییت" is what a
+    # Persian writer would have typed, and it keeps the separator count at one.
+    if total > shown:
+        byline = f"🧵 ترد {fa_number(shown)} از {fa_number(total)} توییت"
+    else:
+        byline = f"🧵 ترد {fa_number(shown)} توییت"
+    if author:
+        byline = f"{byline} — @{author}"
+
+    notes: list[str] = []
+    if total > shown:
+        root_url = _thread_continuation_url(result)
+        tail = f"ادامه: {root_url}" if root_url else "برای ادامه، لینک ترد را باز کنید"
+        notes.append(
+            f"⚠️ {fa_number(total - shown)} توییت دیگر در این ترد بود و ارسال نشد؛ {tail}"
+        )
+    delivered_ids = {str(getattr(item, "item_id", "") or "") for item in items}
+    if focal_id and focal_id not in delivered_ids:
+        notes.append(f"👈 توییت درخواستی شما در {fa_number(shown)} توییت اول این ترد نبود.")
+
+    text = "\n\n".join([*blocks, byline, *notes]).strip()
+    return text or None
+
+
 def _split_long_line(line: str, max_length: int) -> list[str]:
     """Split a single over-long line, preferring to break at whitespace."""
     pieces: list[str] = []

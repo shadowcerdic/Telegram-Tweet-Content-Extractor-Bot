@@ -9,11 +9,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
+import constants
 import translator
 from constants import (
     FXTWITTER_API_BASE,
     MAX_UPLOAD_BYTES,
     REQUEST_TIMEOUT,
+    THREAD_TIME_BUDGET_S,
     TRANSLATE_FALLBACK,
     TRANSLATE_REFETCH_BACKOFF_S,
     TRANSLATE_REFETCH_TRIES,
@@ -55,6 +57,62 @@ class TweetPayload:
         return [MediaItem("photo", url) for url in self.photos] + [
             MediaItem("video", url) for url in self.videos
         ]
+
+
+@dataclass
+class ThreadItem:
+    """One position in a thread: either a parsed tweet or an X-reported hole.
+
+    ``payload`` is None when the chain contains a tombstone (deleted, suspended,
+    private, ...). Keeping the hole instead of dropping it preserves the counters,
+    and the renderer labels why — silently skipping a deleted tweet would read as
+    the bot having lost part of the thread.
+    """
+
+    payload: TweetPayload | None = None
+    unavailable: str | None = None
+    item_id: str = ""
+    author_screen_name: str = ""
+
+    @property
+    def is_unavailable(self) -> bool:
+        return self.payload is None
+
+
+@dataclass
+class ThreadResult:
+    """A thread resolved for delivery.
+
+    ``items`` is the capped, root-first slice the renderer walks; ``focal`` is the
+    tweet the user actually linked (always available from the same response, so
+    delivery never depends on the focal tweet being inside the cap) and ``root`` is
+    the first item of the chain, used for the continuation link and the byline.
+    ``dropped`` holds the items past the cap: not renderable here, but they name the
+    tweet the continuation link should open on.
+    """
+
+    items: list[ThreadItem]
+    root: ThreadItem
+    focal: TweetPayload
+    requested_id: str
+    total: int
+    truncated: int = 0
+    dropped: list[ThreadItem] = field(default_factory=list)
+
+    def media_items(self) -> list[MediaItem]:
+        """Every fitting media file in the delivered slice, in thread order."""
+        items: list[MediaItem] = []
+        for item in self.items:
+            if item.payload is not None:
+                items.extend(item.payload.media_items())
+        return items
+
+    def oversized_videos(self) -> list[dict[str, Any]]:
+        oversized: list[dict[str, Any]] = []
+        for item in self.items:
+            if item.payload is not None:
+                oversized.extend(item.payload.oversized_videos)
+        return oversized
 
 
 def _urls(items: Any) -> list[str]:
@@ -246,7 +304,9 @@ def _scrub_echo(tweet: dict[str, Any], translate_to: str) -> None:
         tweet["translation"] = None
 
 
-def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None:
+def _ensure_translation(
+    tweet: dict[str, Any], translate_to: str | None, tries: int | None = None
+) -> None:
     """Fill ``tweet["translation"]`` for the three known FxTwitter failure modes.
 
     0. echo — ``translation.text`` equals the original (see ``_scrub_echo``), so
@@ -285,7 +345,7 @@ def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None
         TRANSLATE_REFETCH_TRIES_NOTE
         if tweet.get("is_note_tweet")
         else TRANSLATE_REFETCH_TRIES
-    )
+    ) if tries is None else tries
     if tweet_id and tries > 0:
         for attempt in range(1, tries + 1):
             if attempt > 1 and TRANSLATE_REFETCH_BACKOFF_S > 0:
@@ -350,6 +410,208 @@ def _parse_quote(raw: Any, translate_to: str | None) -> tuple[TweetPayload | Non
     payload.quote = None
     payload.quote_unavailable = None
     return payload, None
+
+
+def _fetch_thread_raw(
+    tweet_id: str, translate_to: str | None = None
+) -> dict[str, Any] | None:
+    """One FxTwitter v2 thread lookup -> the response envelope, or None.
+
+    ``GET /2/thread/{id}`` walks the self-reply chain in both directions, so any
+    link inside a thread returns the whole thing, root first (measured live on
+    id 2119728555940843648: 7 items, root first, from a mid-thread link too).
+    A plain tweet comes back as a single-item ``thread``, which is what makes the
+    probe safe. ``?lang=`` additionally fills ``translation`` on every item X
+    could translate.
+
+    401/403/404 and ``code != 200`` mean "no thread" (the tweet path renders the
+    real error); a transport failure raises ``requests.RequestException``.
+    """
+    url = f"{FXTWITTER_API_BASE}/2/thread/{tweet_id}"
+    if translate_to:
+        url = f"{url}?lang={translate_to}"
+
+    response = _session.get(url, timeout=REQUEST_TIMEOUT)
+
+    if response.status_code in (401, 403, 404):
+        return None
+    response.raise_for_status()
+
+    data: dict[str, Any] = response.json()
+    if data.get("code") != 200:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _thread_quote_for_item(
+    item: TweetPayload, translate_to: str | None
+) -> tuple[TweetPayload | None, str | None]:
+    """Parse one thread item's quoted post with the single-tweet rules.
+
+    Depth stays capped at 1 (no quote inside a quote) and an item quoting itself
+    is dropped, exactly like the single-tweet path. A self-reply inside a thread
+    is NOT a loop: authors use it to point back at an earlier item, and that card
+    is the only place the reader sees it.
+    """
+    quote, unavailable = _parse_quote(item.tweet.get("quote"), translate_to)
+    if quote is not None and str(quote.tweet.get("id") or "") == str(item.tweet.get("id") or ""):
+        return None, None
+    return quote, unavailable
+
+
+def _ensure_thread_item_translation(
+    item: TweetPayload, translate_to: str | None
+) -> None:
+    """Fill the translation for one thread item X did not translate inline.
+
+    ``/2/thread/{id}?lang=`` answers 6 of 7 items on one probe and 7 of 7 on the
+    next (measured live), so a missing item is normally flaky, not dead. The retry
+    therefore re-fetches THIS item's own translate endpoint, not the thread again:
+    refetching the thread would retranslate every item to recover one.
+    """
+    if not translate_to:
+        return
+    _scrub_echo(item.tweet, translate_to)
+    if not _needs_translation(item.tweet, translate_to):
+        return
+    tries = constants.THREAD_TRANSLATE_REFETCH_TRIES
+    _ensure_translation(
+        item.tweet, translate_to,
+        tries=TRANSLATE_REFETCH_TRIES if tries is None else tries,
+    )
+
+
+def get_thread_result(
+    tweet_id: str,
+    translate_to: str | None = None,
+    max_items: int | None = None,
+) -> ThreadResult | None:
+    """Resolve a link into the whole thread it belongs to.
+
+    Returns ``None`` whenever the single-tweet path must be used instead: the
+    feature is off, the probe or the envelope is unusable, the requested tweet
+    itself is gone, or nothing would be added to what ``get_tweet_payload``
+    already delivers (a one-item thread). ``requests.RequestException`` propagates
+    like any other upstream failure — a dead thread probe must not invent a
+    thread, and the caller's error path already names the failure to the user.
+
+    Translation: items already carrying an inline ``translation`` from the thread
+    response are trusted as-is (echoes scrubbed); the rest go through the same
+    layers as a lone tweet, with ``THREAD_TRANSLATE_REFETCH_TRIES`` plain refetches
+    because the cost multiplies by the thread length.
+    """
+    if constants.THREAD_FETCH == "off":
+        return None
+    if max_items is None:
+        # Read at call time: a default argument would freeze the env value at import.
+        max_items = constants.THREAD_MAX_TWEETS
+    if max_items < 2:
+        return None
+
+    try:
+        data = _fetch_thread_raw(tweet_id, translate_to)
+    except requests.RequestException as exc:
+        log.info("Thread probe for %s failed: %s", tweet_id, exc)
+        return None
+
+    if not data:
+        return None
+
+    items = data.get("thread")
+    focal = data.get("status") or data.get("tweet")
+    if not isinstance(items, list) or not isinstance(focal, dict):
+        return None
+
+    # The cap is not the only thing that can cut a thread short: per-item
+    # translation retries multiply, so a deadline bounds the whole delivery and the
+    # items it drops are recorded for the continuation note like any other overflow.
+    deadline = time.monotonic() + constants.THREAD_TIME_BUDGET_S
+    budget_out = 0
+    first_cut: dict[str, Any] | None = None
+    parsed: list[ThreadItem] = []
+    for position, raw in enumerate(items):
+        if time.monotonic() >= deadline:
+            budget_out = len(items) - position
+            first_cut = raw if isinstance(raw, dict) else None
+            log.info(
+                "Thread %s cut after %s item(s): %.0fs budget spent",
+                tweet_id, len(parsed), constants.THREAD_TIME_BUDGET_S,
+            )
+            break
+        if not isinstance(raw, dict):
+            continue
+        if (raw.get("type") or "").lower() == "tombstone":
+            parsed.append(
+                ThreadItem(
+                    unavailable=str(raw.get("reason") or "unavailable"),
+                    item_id=str(raw.get("id") or ""),
+                    author_screen_name=str(raw.get("author") or ""),
+                )
+            )
+            continue
+        payload = _build_payload(raw)
+        _ensure_thread_item_translation(payload, translate_to)
+        quote, unavailable = _thread_quote_for_item(payload, translate_to)
+        payload.quote = quote
+        payload.quote_unavailable = unavailable
+        parsed.append(
+            ThreadItem(
+                payload=payload,
+                item_id=str(payload.tweet.get("id") or ""),
+                author_screen_name=str(
+                    (payload.tweet.get("author") or {}).get("screen_name") or ""
+                ),
+            )
+        )
+
+    if not parsed:
+        return None
+
+    focal_payload = _build_payload(focal)
+    _ensure_thread_item_translation(focal_payload, translate_to)
+    focal_quote, focal_quote_unavailable = _thread_quote_for_item(
+        focal_payload, translate_to
+    )
+    focal_payload.quote = focal_quote
+    focal_payload.quote_unavailable = focal_quote_unavailable
+
+    focal_id = str(focal_payload.tweet.get("id") or tweet_id)
+    kept = parsed[: max(1, max_items)]
+    truncated = len(parsed) - len(kept) + budget_out
+    if len(parsed) < 2:
+        return None
+    if all(item.payload is None for item in kept) and not truncated:
+        # Nothing renderable was dropped into the cap: the focal path says it best.
+        return None
+
+    total = len(parsed) + budget_out
+    # The renderer needs exactly one thing from the overflow: the id/author of the
+    # first item we did not deliver, to build the "ادامه" link.
+    dropped: list[ThreadItem] = parsed[len(kept):][:1]
+    if not dropped and first_cut is not None:
+        item_id = str(first_cut.get("id") or "")
+        author = first_cut.get("author")
+        if not item_id:
+            item_id = str(author.get("id") or "") if isinstance(author, dict) else ""
+        if item_id:
+            dropped = [
+                ThreadItem(
+                    item_id=item_id,
+                    author_screen_name=(
+                        str(author.get("screen_name") or "") if isinstance(author, dict)
+                        else str(author or "")
+                    ),
+                )
+            ]
+    return ThreadResult(
+        items=kept,
+        root=parsed[0],
+        focal=focal_payload,
+        requested_id=focal_id,
+        total=total,
+        truncated=truncated,
+        dropped=dropped,
+    )
 
 
 def get_tweet_payload(tweet_id: str, translate_to: str | None = None) -> TweetPayload | None:

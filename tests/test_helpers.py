@@ -233,5 +233,156 @@ class QuoteSection(unittest.TestCase):
         self.assertIn("متن اصلی (ترجمه در دسترس نبود):", block)
 
 
+class ThreadRender(unittest.TestCase):
+    """A thread renders as ONE continuous message with chain-position counters."""
+
+    def setUp(self):
+        self._old = helpers.TRANSLATE_TO
+        helpers.TRANSLATE_TO = "fa"
+        self.addCleanup(setattr, helpers, "TRANSLATE_TO", self._old)
+
+    @staticmethod
+    def _item(item_id, text="", **kw):
+        import x_client
+
+        payload_kwargs = {"tweet": {
+            "id": item_id,
+            "text": text,
+            "lang": kw.pop("lang", "fa"),
+            "url": f"https://x.com/a/status/{item_id}",
+            "author": {"name": "A Name", "screen_name": kw.pop("author", "a"),
+                        "url": f"https://x.com/a"},
+            **kw,
+        }}
+        media = kw.pop("media", None)
+        payload_kwargs["photos"] = media or []
+        return x_client.ThreadItem(payload=x_client.TweetPayload(**payload_kwargs), item_id=item_id)
+
+    def _result(self, items, requested, total=None, truncated=0, dropped=None):
+        import x_client
+
+        return x_client.ThreadResult(
+            items=items,
+            root=items[0] if items else x_client.ThreadItem(item_id=""),
+            focal=items[0].payload if items and items[0].payload else None,
+            requested_id=requested,
+            total=total if total is not None else len(items),
+            truncated=truncated,
+            dropped=dropped if dropped is not None else [],
+        )
+
+    def test_counters_are_persian_and_ordered(self):
+        thread = self._result([self._item("1", "اول"), self._item("2", "دوم")], "1")
+        text = helpers.build_thread_text(thread)
+        self.assertIn("۱/۲", text)
+        self.assertIn("۲/۲", text)
+        self.assertIn("اول", text)
+        self.assertIn("دوم", text)
+        self.assertIn(helpers.THREAD_ITEM_SEPARATOR, text)
+
+    def test_the_link_the_user_sent_is_marked(self):
+        thread = self._result([self._item("1", "اول"), self._item("2", "دوم")], "2")
+        text = helpers.build_thread_text(thread)
+        self.assertIn("👈 توییتی که فرستادید", text)
+
+    def test_every_item_carries_its_own_link(self):
+        thread = self._result([self._item("1", "اول"), self._item("2", "دوم")], "1")
+        text = helpers.build_thread_text(thread)
+        self.assertIn("🔗 https://x.com/a/status/1", text)
+        self.assertIn("🔗 https://x.com/a/status/2", text)
+
+    def test_byline_names_the_count_and_author(self):
+        thread = self._result([self._item("1", "a"), self._item("2", "b")], "1")
+        text = helpers.build_thread_text(thread)
+        self.assertIn("🧵 ترد ۲ توییت — @a", text)
+
+    def test_a_hole_keeps_its_position_and_is_labelled(self):
+        import x_client
+
+        items = [self._item("1", "اول"), x_client.ThreadItem(unavailable="deleted", item_id=""), self._item("3", "سوم")]
+        text = helpers.build_thread_text(self._result(items, "1"))
+        self.assertIn("❌ توییت حذف شده", text)
+        self.assertIn("۳/۳", text)  # the deleted tweet still counts
+
+    def test_truncation_is_announced_with_the_continuation_link(self):
+        items = [self._item("1", "اول"), self._item("2", "دوم")]
+        thread = self._result(
+            items, "1", total=7, truncated=5, dropped=[self._item("3", "سوم")]
+        )
+        text = helpers.build_thread_text(thread)
+        self.assertIn("⚠️ ۵ توییت دیگر در این ترد بود و ارسال نشد", text)
+        # the link opens WHERE WE STOPPED, not back at the root the reader already got
+        self.assertIn("ادامه: https://x.com/a/status/3", text)
+        self.assertIn("🧵 ترد ۲ از ۷ توییت", text)
+
+    def test_continuation_falls_back_to_the_root_without_a_dropped_item(self):
+        items = [self._item("1", "اول"), self._item("2", "دوم")]
+        thread = self._result(items, "1", total=7, truncated=5)
+        text = helpers.build_thread_text(thread)
+        assert text is not None
+        self.assertIn("ادامه: https://x.com/a/status/1", text)
+
+    def test_continuation_of_a_dropped_item_without_a_payload(self):
+        """A dropped item only carries id + author, so the link is still buildable."""
+        import x_client
+
+        items = [self._item("1", "اول"), self._item("2", "دوم")]
+        thread = self._result(
+            items, "1", total=4, truncated=2,
+            dropped=[x_client.ThreadItem(item_id="3", author_screen_name="b")],
+        )
+        text = helpers.build_thread_text(thread)
+        assert text is not None
+        self.assertIn("ادامه: https://x.com/b/status/3", text)
+
+    def test_requested_tweet_outside_the_cap_says_so(self):
+        items = [self._item("1", "اول"), self._item("2", "دوم")]
+        thread = self._result(items, "99", total=40, truncated=38)
+        text = helpers.build_thread_text(thread)
+        self.assertIn("توییت درخواستی شما در ۲ توییت اول این ترد نبود", text)
+
+    def test_media_only_item_is_not_an_empty_gap(self):
+        item = self._item("1", "")
+        text = helpers.build_thread_text(self._result([item], "1"))
+        self.assertIn("(بدون متن", text)
+
+    def test_translation_and_original_both_render(self):
+        item = self._item("1", "hello", lang="en", translation={"text": "سلام"})
+        text = helpers.build_thread_text(self._result([item], "1"))
+        self.assertIn("Original:\n\nhello", text)
+        self.assertIn("ترجمه فارسی:\n\nسلام", text)
+
+    def test_untranslated_item_is_marked_not_silent(self):
+        item = self._item("1", "hello", lang="en")
+        text = helpers.build_thread_text(self._result([item], "1"))
+        self.assertIn("متن اصلی (ترجمه در دسترس نبود):", text)
+
+    def test_quote_card_inside_a_thread_item(self):
+        item = self._item("1", "اول")
+        import x_client
+
+        item.payload.quote = x_client.TweetPayload(tweet={
+            "id": "77", "text": "متن نقل‌قول", "lang": "fa",
+            "url": "https://x.com/q/status/77",
+            "author": {"name": "Q", "screen_name": "q"},
+        })
+        text = helpers.build_thread_text(self._result([item], "1"))
+        self.assertIn("↩️ نقل‌قول از Q (@q):", text)
+        self.assertIn("متن نقل‌قول", text)
+
+    def test_empty_thread_renders_nothing(self):
+        self.assertIsNone(helpers.build_thread_text(self._result([], "1")))
+
+    def test_fa_number_covers_multi_digits(self):
+        self.assertEqual(helpers.fa_number(20), "۲۰")
+        self.assertEqual(helpers.fa_number("7/7"), "۷/۷")
+
+    def test_unavailable_labels(self):
+        self.assertEqual(helpers.unavailable_label("deleted"), "حذف شده")
+        self.assertEqual(helpers.unavailable_label("suspended"), "حساب معلق است")
+        self.assertEqual(helpers.unavailable_label("weird"), "در دسترس نیست (weird)")
+        self.assertEqual(helpers.unavailable_label(None), "در دسترس نیست")
+
+
 if __name__ == "__main__":
     unittest.main()
