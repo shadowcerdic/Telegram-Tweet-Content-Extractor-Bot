@@ -348,16 +348,69 @@ class XClientQuote(unittest.TestCase):
 class TranslationFallback(unittest.TestCase):
     """The measured gap: fxtwitter returns nothing for certain tweet/language pairs."""
 
-    def test_note_tweet_goes_straight_to_the_fallback(self):
-        """Long-form tweets fail deterministically, so the re-fetch would be wasted."""
+    def test_note_tweet_retry_recovers_a_transient_gap(self):
+        """The 2026-11-09 live case (id 2119479031611507061 -> fa): empty on the
+        first lookup, translated on the next. Notes must NOT skip the re-fetch."""
         note = _tweet(id="9", text="x" * 1000, lang="en", is_note_tweet=True)
-        with mock.patch.object(x_client._session, "get",
-                               return_value=resp(200, _envelope(note))) as get, \
-             mock.patch.object(x_client.translator, "translate", return_value="متن فارسی") as fb:
+        answered = dict(note, translation={"text": "متن فارسی", "provider": "grok"})
+        with mock.patch.object(
+            x_client._session, "get",
+            side_effect=[resp(200, _envelope(note)), resp(200, _envelope(answered))],
+        ) as get, \
+             mock.patch.object(x_client.translator, "translate",
+                               return_value="این نباید صدا زده شود") as fb, \
+             mock.patch.object(x_client.time, "sleep") as sleep:
+            result = _fetched("9", translate_to="fa")
+        self.assertEqual(get.call_count, 2)
+        fb.assert_not_called()
+        self.assertEqual(result.tweet["translation"]["text"], "متن فارسی")
+        self.assertEqual(result.tweet["translation"]["provider"], "grok")
+        sleep.assert_not_called()  # the first re-fetch is immediate
+
+    def test_note_tweet_exhausts_its_retries_then_uses_the_fallback(self):
+        """A deterministic gap still reaches the keyless fallback, after the
+        extra attempts and the backoff between them."""
+        note = _tweet(id="9", text="x" * 1000, lang="en", is_note_tweet=True)
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _envelope(note))
+        ) as get, \
+             mock.patch.object(x_client.translator, "translate",
+                               return_value="متن فارسی") as fb, \
+             mock.patch.object(x_client.time, "sleep") as sleep:
+            result = _fetched("9", translate_to="fa")
+        self.assertEqual(get.call_count, 1 + x_client.TRANSLATE_REFETCH_TRIES_NOTE)
+        fb.assert_called_once()
+        self.assertEqual(result.tweet["translation"]["provider"], "google-fallback")
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list],
+            [
+                x_client.TRANSLATE_REFETCH_BACKOFF_S * (2 ** i)
+                for i in range(x_client.TRANSLATE_REFETCH_TRIES_NOTE - 1)
+            ],
+        )
+
+    def test_short_tweet_still_gets_exactly_one_retry(self):
+        """Unchanged behaviour for the path that already had a re-fetch."""
+        outer = _tweet(id="5", text="hello", lang="en")
+        with mock.patch.object(
+            x_client._session, "get",
+            side_effect=[resp(200, _envelope(outer))] * 3,
+        ) as get, \
+             mock.patch.object(x_client.translator, "translate", return_value="سلام"), \
+             mock.patch.object(x_client.time, "sleep"):
+            _fetched("5", translate_to="fa")
+        self.assertEqual(get.call_count, 1 + x_client.TRANSLATE_REFETCH_TRIES)
+
+    def test_retries_can_be_switched_off_without_losing_the_fallback(self):
+        """TRANSLATE_REFETCH_TRIES=0 restores the old one-call behaviour."""
+        note = _tweet(id="9", text="x" * 1000, lang="en", is_note_tweet=True)
+        with mock.patch.object(
+            x_client._session, "get", return_value=resp(200, _envelope(note))
+        ) as get, \
+             mock.patch.object(x_client.translator, "translate", return_value="متن فارسی"), \
+             mock.patch.object(x_client, "TRANSLATE_REFETCH_TRIES_NOTE", 0):
             result = _fetched("9", translate_to="fa")
         self.assertEqual(get.call_count, 1)
-        fb.assert_called_once()
-        self.assertEqual(result.tweet["translation"]["text"], "متن فارسی")
         self.assertEqual(result.tweet["translation"]["provider"], "google-fallback")
 
     def test_fallback_also_covers_the_outer_tweet(self):
@@ -374,7 +427,8 @@ class TranslationFallback(unittest.TestCase):
         outer = _tweet(id="6", text="hello", lang="en", is_note_tweet=True)
         with mock.patch.object(x_client._session, "get",
                                return_value=resp(200, _envelope(outer))), \
-             mock.patch.object(x_client.translator, "translate", return_value=None):
+             mock.patch.object(x_client.translator, "translate", return_value=None), \
+             mock.patch.object(x_client.time, "sleep"):
             result = _fetched("6", translate_to="fa")
         self.assertEqual(result.tweet["text"], "hello")
         self.assertFalse((result.tweet.get("translation") or {}).get("text"))

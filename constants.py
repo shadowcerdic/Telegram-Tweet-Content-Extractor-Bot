@@ -52,6 +52,18 @@ INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE", "").strip()
 # (tweet, language) pair: "google" = keyless web endpoint, "off" = never call it.
 TRANSLATE_FALLBACK = os.getenv("TRANSLATE_FALLBACK", "google").strip().lower()
 
+# Extra FxTwitter translate lookups when the first answer carries no
+# ``translation``. The old rule ("note tweets fail deterministically, so a
+# re-fetch is wasted motion") was measured on ONE 1032-char note; a second
+# case on 2026-11-09 proved the opposite for that shape: a 2956-char note
+# (id 2119479031611507061 -> fa) came back empty on the first attempt and
+# translated on all six following attempts. Notes therefore get MORE attempts
+# than short tweets, not zero, and only fall back after they are exhausted.
+TRANSLATE_REFETCH_TRIES = int(os.getenv("TRANSLATE_REFETCH_TRIES", "1"))
+TRANSLATE_REFETCH_TRIES_NOTE = int(os.getenv("TRANSLATE_REFETCH_TRIES_NOTE", "2"))
+# Seconds of exponential wait before each retry (0 disables it).
+TRANSLATE_REFETCH_BACKOFF_S = float(os.getenv("TRANSLATE_REFETCH_BACKOFF_S", "0.4"))
+
 # YouTube downloader proxy (Cloudflare WARP default on VPS to avoid datacenter IP bot detection)
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "socks5://127.0.0.1:40000").strip()
 

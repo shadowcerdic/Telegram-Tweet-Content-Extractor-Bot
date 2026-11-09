@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,9 @@ from constants import (
     MAX_UPLOAD_BYTES,
     REQUEST_TIMEOUT,
     TRANSLATE_FALLBACK,
+    TRANSLATE_REFETCH_BACKOFF_S,
+    TRANSLATE_REFETCH_TRIES,
+    TRANSLATE_REFETCH_TRIES_NOTE,
 )
 from models import MediaItem
 
@@ -248,13 +252,20 @@ def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None
     0. echo — ``translation.text`` equals the original (see ``_scrub_echo``), so
        the pair silently failed even though the field is populated.
     1. transient — the translate backend sometimes answers without a
-       ``translation`` field on a short tweet; one re-fetch recovers it.
-    2. deterministic — specific (tweet, target-language) pairs always come back
-       untranslated. Measured on a 1032-char note tweet: ``fa``/``de``/``hi``
-       empty on six consecutive attempts while ``ar``/``tr``/``es``/``fr``/
-       ``ja``/``pt``/``ru``/``ko``/``zh-CN`` all succeeded for the same tweet.
-       Long-form (note) tweets are the reliable signature, so those skip the
-       pointless re-fetch and go straight to the keyless Google endpoint.
+       ``translation`` field; a re-fetch recovers it on the next attempt. This is
+       the common shape for BOTH short and long tweets, and it is what bit the
+       2026-11-09 case below.
+    2. deterministic — some (tweet, target-language) pairs never translate.
+       Measured on a 1032-char note tweet: ``fa``/``de``/``hi`` empty on six
+       consecutive attempts while ``ar``/``tr``/``es``/``fr``/``ja``/``pt``/
+       ``ru``/``ko``/``zh-CN`` all succeeded for the same tweet. That one sample
+       was the basis for skipping the re-fetch on note tweets, and it was wrong
+       as a rule: a 2956-char note (id 2119479031611507061 -> fa) was empty on
+       attempt 1 and translated on attempts 2-7, while the keyless Google backup
+       was returning HTTP 429 from this host — so the skip cost the recovery.
+       Note tweets now get ``TRANSLATE_REFETCH_TRIES_NOTE`` attempts (more than
+       short tweets, because theirs are the slower/flakier calls) and only reach
+       the fallback once those are exhausted.
 
     Mutates ``tweet``; never raises. When no layer produces a real translation
     the text stays as-is and helpers render "ترجمه در دسترس نبود" — silence would
@@ -270,17 +281,34 @@ def _ensure_translation(tweet: dict[str, Any], translate_to: str | None) -> None
     lang = (tweet.get("lang") or "").strip().lower()
     tweet_id = str(tweet.get("id") or "")
 
-    if tweet_id and not tweet.get("is_note_tweet"):
-        try:
-            again = _fetch_tweet_raw(tweet_id, translate_to)
-        except requests.RequestException as exc:
-            log.info("translate retry for %s failed: %s", tweet_id, exc)
-            again = None
-        if again and (again.get("translation") or {}).get("text"):
-            tweet["translation"] = again["translation"]
-            _scrub_echo(tweet, translate_to)
-            if not _needs_translation(tweet, translate_to):
-                return
+    tries = (
+        TRANSLATE_REFETCH_TRIES_NOTE
+        if tweet.get("is_note_tweet")
+        else TRANSLATE_REFETCH_TRIES
+    )
+    if tweet_id and tries > 0:
+        for attempt in range(1, tries + 1):
+            if attempt > 1 and TRANSLATE_REFETCH_BACKOFF_S > 0:
+                time.sleep(TRANSLATE_REFETCH_BACKOFF_S * (2 ** (attempt - 2)))
+            try:
+                again = _fetch_tweet_raw(tweet_id, translate_to)
+            except requests.RequestException as exc:
+                log.info(
+                    "translate retry %s/%s for %s failed: %s", attempt, tries, tweet_id, exc
+                )
+                again = None
+            if again and (again.get("translation") or {}).get("text"):
+                tweet["translation"] = again["translation"]
+                _scrub_echo(tweet, translate_to)
+                if not _needs_translation(tweet, translate_to):
+                    log.info(
+                        "Tweet %s: translation recovered by fxtwitter retry %s/%s (note=%s)",
+                        tweet_id,
+                        attempt,
+                        tries,
+                        bool(tweet.get("is_note_tweet")),
+                    )
+                    return
 
     translated = translator.translate(tweet.get("text") or "", translate_to)
     if translated:
