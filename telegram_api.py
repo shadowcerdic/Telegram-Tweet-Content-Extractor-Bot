@@ -266,6 +266,7 @@ def send_media(
     caption: str | None = None,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
+    parse_mode: str | None = None,
 ) -> dict[str, Any]:
     """Send one photo/video, from a URL or a local file."""
     if item.kind not in {"photo", "video"}:
@@ -278,6 +279,8 @@ def send_media(
     data = _target(chat_id, reply_to_message_id, message_thread_id)
     if caption:
         data["caption"] = caption[:CAPTION_LIMIT]
+    if caption and parse_mode:
+        data["parse_mode"] = parse_mode
     if item.kind == "video":
         data["supports_streaming"] = True
 
@@ -296,6 +299,7 @@ def send_media_group(
     caption: str | None = None,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
+    parse_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """Send an album of 2-10 items. URL and local-file items can be mixed."""
     if not 2 <= len(items) <= MEDIA_GROUP_MAX:
@@ -328,6 +332,10 @@ def send_media_group(
                 entry["supports_streaming"] = True
             if index == 0 and caption:
                 entry["caption"] = caption[:CAPTION_LIMIT]
+                if parse_mode:
+                    # In a media group the caption's parse mode belongs to the
+                    # InputMedia entry, not to the top-level request.
+                    entry["parse_mode"] = parse_mode
             media.append(entry)
 
         data = _target(chat_id, reply_to_message_id, message_thread_id)

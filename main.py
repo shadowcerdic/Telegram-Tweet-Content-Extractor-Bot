@@ -36,6 +36,7 @@ from helpers import (
     fa_number,
     load_last_update_id,
     quote_author_label,
+    rich_byline,
     save_last_update_id,
     unavailable_label,
 )
@@ -79,10 +80,13 @@ class Ctx:
     chat_id: int
     message_id: int | None
     thread_id: int | None = None  # only set for forum topics
+    # With DELETE_SOURCE_LINK the message a reply would quote is deleted, and a
+    # reply to a deleted message renders as "↩ پیام حذف‌شده" on every delivery.
+    reply_enabled: bool = True
 
     def target(self, reply: bool = True) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
-        if reply and self.message_id is not None:
+        if reply and self.message_id is not None and self.reply_enabled:
             kwargs["reply_to_message_id"] = self.message_id
         if self.thread_id is not None:
             kwargs["message_thread_id"] = self.thread_id
@@ -146,18 +150,33 @@ class Status:
 # ---------------------------------------------------------------------------
 
 
-def send_text(ctx: Ctx, text: str, reply: bool = True) -> None:
+def send_text(ctx: Ctx, text: str, reply: bool = True,
+              parse_mode: str | None = None) -> None:
     for index, part in enumerate(chunk_text(text)):
-        send_message(ctx.chat_id, part, **ctx.target(reply and index == 0))
+        kwargs = ctx.target(reply and index == 0)
+        # Only pass the mode when it is set, so the plain path sends exactly the
+        # same call it always did.
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        send_message(ctx.chat_id, part, **kwargs)
+
+
+def _parse_mode() -> str | None:
+    """HTML only for text this bot renders itself (RICH_LAYOUT); None = plain."""
+    return "HTML" if constants.RICH_LAYOUT else None
 
 
 def _send_chunk_once(
-    ctx: Ctx, chunk: list[MediaItem], caption: str | None, reply: bool
+    ctx: Ctx, chunk: list[MediaItem], caption: str | None, reply: bool,
+    parse_mode: str | None = None,
 ) -> None:
+    kwargs = ctx.target(reply)
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
     if len(chunk) == 1:
-        send_media(ctx.chat_id, chunk[0], caption=caption, **ctx.target(reply))
+        send_media(ctx.chat_id, chunk[0], caption=caption, **kwargs)
     else:
-        send_media_group(ctx.chat_id, chunk, caption=caption, **ctx.target(reply))
+        send_media_group(ctx.chat_id, chunk, caption=caption, **kwargs)
 
 
 def _needs_local_upload(item: MediaItem, force_local: bool) -> bool:
@@ -171,6 +190,7 @@ def send_chunk(
     caption: str | None,
     reply: bool,
     force_local: bool = False,
+    parse_mode: str | None = None,
 ) -> bool:
     """Send one chunk of media; returns True if URL delivery fell back to local upload."""
     ctx.action("upload_video" if any(i.kind == "video" for i in chunk) else "upload_photo")
@@ -178,11 +198,11 @@ def send_chunk(
     if force_local and any(item.is_url for item in chunk):
         with tempfile.TemporaryDirectory(prefix="tgbot_") as tmp:
             local = [download_media(i, tmp) if i.is_url else i for i in chunk]
-            _send_chunk_once(ctx, local, caption, reply)
+            _send_chunk_once(ctx, local, caption, reply, parse_mode)
         return True
 
     try:
-        _send_chunk_once(ctx, chunk, caption, reply)
+        _send_chunk_once(ctx, chunk, caption, reply, parse_mode)
         return force_local
     except TelegramError as exc:
         # 400 = Telegram couldn't fetch the URL itself (too large, blocked, ...).
@@ -200,7 +220,7 @@ def send_chunk(
                     for i in chunk
                 ]
                 try:
-                    _send_chunk_once(ctx, partial, caption, reply)
+                    _send_chunk_once(ctx, partial, caption, reply, parse_mode)
                     return True
                 except TelegramError as exc2:
                     if exc2.error_code != 400:
@@ -209,7 +229,7 @@ def send_chunk(
                 download_media(i, tmp) if i.is_url else i
                 for i in chunk
             ]
-            _send_chunk_once(ctx, local, caption, reply)
+            _send_chunk_once(ctx, local, caption, reply, parse_mode)
         return True
 
 
@@ -220,6 +240,7 @@ def deliver(
     extra_items: list[MediaItem] | None = None,
     extra_caption: str | None = None,
     trailing_caption: str | None = None,
+    parse_mode: str | None = None,
 ) -> None:
     """Send ``items`` with ``text``.
 
@@ -242,13 +263,13 @@ def deliver(
 
     if not items and not extra_items:
         if text:
-            send_text(ctx, text)
+            send_text(ctx, text, parse_mode=parse_mode)
         return
 
     reply_to_original = True
     text_caption = text if (text and len(text) <= CAPTION_LIMIT) else None
     if text and text_caption is None:
-        send_text(ctx, text)
+        send_text(ctx, text, parse_mode=parse_mode)
         reply_to_original = False
 
     pending_extra_caption = extra_caption
@@ -268,7 +289,8 @@ def deliver(
         if caption is None and trailing_caption and position == len(chunks) - 1:
             caption = trailing_caption
         force_local = send_chunk(
-            ctx, chunk, caption=caption, reply=reply_to_original, force_local=force_local
+            ctx, chunk, caption=caption, reply=reply_to_original, force_local=force_local,
+            parse_mode=parse_mode,
         )
         reply_to_original = False
 
@@ -279,10 +301,27 @@ def deliver(
 
 
 def _oversized_note(url: Any, label: str) -> str:
+    link = str(url or "")
+    if constants.RICH_LAYOUT and link.startswith("https://"):
+        # In HTML mode a bare URL is not auto-linked, so the link rides on the word.
+        return (
+            f"⚠️ {label} <a href=\"{html.escape(link, quote=True)}\">بزرگ‌تر</a> از سقف "
+            "۵۰ مگابایت تلگرام است و مستقیماً ارسال نشد."
+        )
     return f"⚠️ {label} ({url}) بزرگتر از سقف ۵۰ مگابایت تلگرام است و مستقیماً ارسال نشد."
 
 
-def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = frozenset()) -> None:
+def _quote_caption(quote_tweet: Any) -> str:
+    """The label worn by a quoted post's own files (rich: linked handle)."""
+    if constants.RICH_LAYOUT:
+        author = quote_tweet.get("author") if isinstance(quote_tweet, dict) else None
+        byline = rich_byline(author)
+        return f"📎 پیوست توییت نقل‌قول‌شده — {byline}" if byline else "📎 پیوست توییت نقل‌قول‌شده"
+    return f"📎 پیوست توییت نقل‌قول‌شده — {quote_author_label(quote_tweet)}"
+
+
+def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = frozenset()) -> bool:
+    """Deliver an Instagram post. True only when files actually went out."""
     status = Status(ctx, "⏳ در حال بررسی لینک اینستاگرام...")
     try:
         status.update("📥 در حال دانلود مدیا از اینستاگرام...")
@@ -292,17 +331,20 @@ def handle_instagram(ctx: Ctx, shortcode: str, _siblings: frozenset[str] = froze
             if not items:
                 log.warning("Instagram %s: download finished with zero media items", shortcode)
                 status.error("❌ مدیای قابل ارسالی در این پست اینستاگرام یافت نشد.")
-                return
+                return False
             log.info("Instagram %s: delivering %d item(s)", shortcode, len(items))
             status.update("📤 در حال ارسال مدیا...")
             deliver(ctx, items, caption)
 
         status.finish()
+        return True
     except MediaFetchError as exc:
         status.error(str(exc))
+        return False
     except Exception:  # noqa: BLE001 - one bad link must not stop the bot
         log.exception("Instagram link failed: %s", shortcode)
         status.error("❌ خطا در پردازش لینک اینستاگرام.")
+        return False
 
 
 def _thread_caption(thread: ThreadResult) -> str:
@@ -312,7 +354,24 @@ def _thread_caption(thread: ThreadResult) -> str:
         label = f"🧵 ترد {fa_number(len(thread.items))} از {fa_number(thread.total)} توییت"
     else:
         label = f"🧵 ترد {fa_number(len(thread.items))} توییت"
+    if constants.RICH_LAYOUT:
+        title = label.split(" ", 1)[1].strip() if label.startswith("🧵") else label
+        handle = f"@{html.escape(from_)}" if from_ else ""
+        url = _thread_author_url(thread)
+        if handle and url.startswith("https://"):
+            handle = f'<a href="{html.escape(url, quote=True)}">{handle}</a>'
+        return f"🧵 <b>{title}</b> {handle}".rstrip()
     return f"{label} — @{from_}" if from_ else label
+
+
+def _thread_author_url(thread: ThreadResult) -> str:
+    for item in thread.items:
+        if item.payload is None:
+            continue
+        author = item.payload.tweet.get("author")
+        if isinstance(author, dict) and (author.get("url") or "").strip():
+            return str(author["url"]).strip()
+    return ""
 
 
 def _thread_author_name(thread: ThreadResult) -> str:
@@ -356,9 +415,7 @@ def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: Twe
         if quote is not None:
             extra_items.extend(quote.media_items())
             if extra_caption is None:
-                extra_caption = (
-                    f"📎 پیوست توییت نقل‌قول‌شده — {quote_author_label(quote.tweet)}"
-                )
+                extra_caption = _quote_caption(quote.tweet)
             notes += [
                 _oversized_note(ov.get("url", ""), f"ویدیوی توییت {fa_number(item.item_id)} نقل‌قول‌شده")
                 for ov in quote.oversized_videos
@@ -378,10 +435,7 @@ def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: Twe
     if focal_payload.quote is not None:
         extra_items = list(focal_payload.quote.media_items()) + extra_items
         if extra_caption is None:
-            extra_caption = (
-                f"📎 پیوست توییت نقل‌قول‌شده — "
-                f"{quote_author_label(focal_payload.quote.tweet)}"
-            )
+            extra_caption = _quote_caption(focal_payload.quote.tweet)
         notes += [
             _oversized_note(ov.get("url", ""), "ویدیوی توییت نقل‌قول‌شده")
             for ov in focal_payload.quote.oversized_videos
@@ -393,7 +447,7 @@ def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: Twe
         text = (text + "\n\n" + "\n".join(notes)).strip()
 
     if not items and not extra_items:
-        send_text(ctx, text)
+        send_text(ctx, text, parse_mode=_parse_mode())
         status.finish()
         return True
 
@@ -406,6 +460,7 @@ def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: Twe
         extra_items=extra_items,
         extra_caption=extra_caption,
         trailing_caption=None if len(text) <= CAPTION_LIMIT else _thread_caption(thread),
+        parse_mode=_parse_mode(),
     )
     status.finish()
     return True
@@ -416,13 +471,16 @@ def handle_tweet(
     tweet_id: str,
     siblings: frozenset[str] = frozenset(),
     delivered_roots: set[str] | None = None,
-) -> None:
+) -> bool:
     """Deliver a tweet: the whole thread it belongs to when it is part of one.
 
     The single-tweet fetch still runs first and its answer is the plain failure
     message the user expects when the post is gone. The thread probe only replaces
     that delivery when FxTwitter reports a chain of two or more tweets, so a lone
     tweet is served byte-for-byte as before.
+
+    True only when something reached the chat: the caller uses it to decide whether
+    the message that carried the link may be deleted.
     """
     status = Status(ctx, "⏳ در حال بررسی لینک X...")
     try:
@@ -433,7 +491,7 @@ def handle_tweet(
         if payload is None:
             log.info("Tweet %s: fetch returned nothing", tweet_id)
             status.error("❌ دریافت این توییت ممکن نشد (حذف شده یا حساب خصوصی است).")
-            return
+            return False
 
         thread = get_thread_result(tweet_id, translate_to=TRANSLATE_TO or None)
         if thread is not None:
@@ -460,7 +518,7 @@ def handle_tweet(
                     len(thread.media_items()),
                     bool((thread.focal.tweet.get("translation") or {}).get("text")),
                 )
-                return
+                return True
 
         # Translation gaps (transient AND the deterministic per-language ones) are
         # recovered inside x_client._ensure_translation, for this tweet and for a
@@ -495,11 +553,7 @@ def handle_tweet(
 
         items = payload.media_items()
         quote_items = quote.media_items() if quote is not None else []
-        quote_caption = (
-            f"📎 پیوست توییت نقل‌قول‌شده — {quote_author_label(quote.tweet)}"
-            if quote is not None
-            else None
-        )
+        quote_caption = _quote_caption(quote.tweet) if quote is not None else None
         log.info(
             "Tweet %s: lang=%r translated=%r same_as_original=%r reply_has_translation=%r quote=%r",
             tweet_id,
@@ -511,23 +565,31 @@ def handle_tweet(
         )
         if not items and not quote_items and not text:
             status.error("❌ محتوای این توییت خالی است.")
-            return
+            return False
 
         status.update("📤 در حال ارسال به تلگرام...")
-        deliver(ctx, items, text, extra_items=quote_items, extra_caption=quote_caption)
+        deliver(ctx, items, text, extra_items=quote_items, extra_caption=quote_caption,
+                parse_mode=_parse_mode())
         status.finish()
+        return True
     except (requests.RequestException, TelegramError) as exc:
         log.warning("X link failed (%s): %s", tweet_id, exc)
         status.error("❌ خطا در پردازش لینک X.")
+        return False
     except Exception:  # noqa: BLE001
         log.exception("X link failed: %s", tweet_id)
         status.error("❌ خطا در پردازش لینک X.")
+        return False
 
 
 def handle_youtube_prompt(
     ctx: Ctx, video_id: str, _siblings: frozenset[str] = frozenset()
-) -> None:
-    """Prompt the user with format choices when a YouTube link is detected."""
+) -> bool:
+    """Prompt the user with format choices when a YouTube link is detected.
+
+    Always False: the file goes out later, from the callback, so the link message
+    is not the thing that has been answered yet and DELETE_SOURCE_LINK leaves it.
+    """
     ctx.action("typing")
     info = get_video_info(video_id)
     title = html.escape(info.title if info else "YouTube Video")
@@ -560,6 +622,7 @@ def handle_youtube_prompt(
         reply_markup=keyboard,
         parse_mode="HTML",
     )
+    return False
 
 
 def handle_youtube_callback(callback_query: dict[str, Any]) -> None:
@@ -663,6 +726,9 @@ def process_message(message: dict[str, Any]) -> None:
         chat_id=chat_id,
         message_id=message.get("message_id"),
         thread_id=message.get("message_thread_id") if message.get("is_topic_message") else None,
+        # A reply to a deleted message reads as "↩ پیام حذف‌شده", so the anchor is
+        # dropped together with the link it quotes.
+        reply_enabled=not constants.DELETE_SOURCE_LINK,
     )
 
     tweet_ids = extract_tweet_ids(text)
@@ -674,7 +740,7 @@ def process_message(message: dict[str, Any]) -> None:
     # thread must not paste the same thread once per link.
     delivered_roots: set[str] = set()
 
-    jobs: list[tuple[Callable[..., None], str]] = [
+    jobs: list[tuple[Callable[..., bool], str]] = [
         (handle_instagram, code) for code in extract_instagram_shortcodes(text)
     ] + [
         (handle_tweet, tweet_id) for tweet_id in tweet_ids
@@ -682,11 +748,39 @@ def process_message(message: dict[str, Any]) -> None:
         (handle_youtube_prompt, yt_id) for yt_id in extract_youtube_ids(text)
     ]
 
+    delivered = False
     for handler, link_id in jobs[:MAX_LINKS_PER_MESSAGE]:
         if handler is handle_tweet:
-            handler(ctx, link_id, siblings, delivered_roots=delivered_roots)
+            ok = handler(ctx, link_id, siblings, delivered_roots=delivered_roots)
         else:
-            handler(ctx, link_id, siblings)
+            ok = handler(ctx, link_id, siblings)
+        delivered = delivered or bool(ok)
+
+    # The link the user sent is only spent once its content is actually in the
+    # chat; a failed link stays visible so it can be retried by re-sending.
+    if delivered and constants.DELETE_SOURCE_LINK:
+        delete_source_message(ctx, message.get("date"))
+
+
+def delete_source_message(ctx: Ctx, sent_at: Any) -> None:
+    """Delete the message that carried the link (Bot API: allowed in private chats).
+
+    A group needs the can_delete_messages right; whatever Telegram refuses is
+    logged and changes nothing about the delivery that already happened.
+    """
+    if ctx.message_id is None:
+        return
+    age = time.time() - int(sent_at or 0)
+    if sent_at and age > constants.DELETE_SOURCE_LINK_MAX_AGE_S:
+        log.info("keeping source message %s: %ds old, past the delete window",
+                 ctx.message_id, int(age))
+        return
+    try:
+        delete_message(ctx.chat_id, ctx.message_id)
+        log.info("deleted source message %s in chat %s (age %ds)",
+                 ctx.message_id, ctx.chat_id, int(age))
+    except TelegramError as exc:
+        log.info("could not delete source message %s: %s", ctx.message_id, exc)
 
 
 def process_update(update: dict[str, Any]) -> None:

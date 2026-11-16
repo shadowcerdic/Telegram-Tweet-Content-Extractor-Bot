@@ -98,6 +98,26 @@ GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 # chunking keeps every request under this many characters.
 TRANSLATE_CHUNK_CHARS = 4500
 
+# --- Clean output layout (inert by default; .env switches it on) -------------
+# RICH_LAYOUT=off keeps every rendered byte exactly as before. Turning it on
+# switches the X rendering to: Persian labels only, the author line as a bold
+# name plus a linked handle (instead of "— Name" + "Profile: <url>"), short
+# thread separators, and one clickable handle per card instead of a raw
+# https://x.com/... URL under every item.
+RICH_LAYOUT = _bool_env("RICH_LAYOUT", False)
+# With a translation available, also deliver the source text under
+# "متن اصلی:". off = translation only (roughly half the characters).
+SHOW_ORIGINAL = _bool_env("SHOW_ORIGINAL", True)
+
+# --- Delete the message that carried the link ---------------------------------
+# Telegram lets a bot delete *incoming* messages in a private chat (Bot API 4.2)
+# and any message in a group where it holds can_delete_messages. Sent content is
+# therefore no longer anchored to the user's link, so the replies are dropped
+# with it (see Ctx.reply_enabled).
+DELETE_SOURCE_LINK = _bool_env("DELETE_SOURCE_LINK", False)
+# Hard Telegram limit is 48 h; stay inside it and log the age instead of failing.
+DELETE_SOURCE_LINK_MAX_AGE_S = _int_env("DELETE_SOURCE_LINK_MAX_AGE_S", 46 * 3600, minimum=60)
+
 REQUEST_TIMEOUT = 30
 UPLOAD_TIMEOUT = 120
 LONG_POLL_TIMEOUT = 30

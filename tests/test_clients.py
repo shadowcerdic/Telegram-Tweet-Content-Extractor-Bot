@@ -11,6 +11,26 @@ import x_client
 from instagram_client import collect_media
 
 
+_saved_layout = None
+
+
+def setUpModule():
+    """These modules guard the PLAIN layout byte-for-byte.
+
+    Production .env switches the clean layout on, and feature flags must never
+    be inherited by a test run -- pinning here (unittest calls it around this
+    module's tests, not at import) keeps the assertion independent of both the
+    machine and the order the modules happen to run in.
+    """
+    global _saved_layout
+    _saved_layout = constants.RICH_LAYOUT
+    constants.RICH_LAYOUT = False
+
+
+def tearDownModule():
+    constants.RICH_LAYOUT = _saved_layout
+
+
 class InstagramCollect(unittest.TestCase):
     def test_carousel_order_is_numeric_not_lexicographic(self):
         with tempfile.TemporaryDirectory() as tmp:

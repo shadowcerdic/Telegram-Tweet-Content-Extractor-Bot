@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+import constants
 import helpers
 import main
 from constants import MAX_MESSAGE_LENGTH
@@ -10,6 +11,26 @@ from telegram_api import TelegramError
 
 URL_PHOTO = MediaItem("photo", "https://pbs.twimg.com/a.jpg")
 URL_VIDEO = MediaItem("video", "https://video.twimg.com/b.mp4")
+
+
+_saved_layout = None
+
+
+def setUpModule():
+    """These modules guard the PLAIN layout byte-for-byte.
+
+    Production .env switches the clean layout on, and feature flags must never
+    be inherited by a test run -- pinning here (unittest calls it around this
+    module's tests, not at import) keeps the assertion independent of both the
+    machine and the order the modules happen to run in.
+    """
+    global _saved_layout
+    _saved_layout = constants.RICH_LAYOUT
+    constants.RICH_LAYOUT = False
+
+
+def tearDownModule():
+    constants.RICH_LAYOUT = _saved_layout
 
 
 class Deliver(unittest.TestCase):
