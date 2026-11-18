@@ -38,6 +38,7 @@ from helpers import (
     quote_author_label,
     rich_byline,
     save_last_update_id,
+    source_link_tail,
     unavailable_label,
 )
 from instagram_client import MediaFetchError, downloaded_instagram_media, purge_temp_dir
@@ -446,6 +447,12 @@ def _deliver_thread(ctx: Ctx, status: Status, thread: ThreadResult, payload: Twe
     if notes:
         text = (text + "\n\n" + "\n".join(notes)).strip()
 
+    # Same delivery-level tail as the single-tweet path: the linked (focal)
+    # tweet's own url, deduped against the per-item links of the plain layout.
+    tail = source_link_tail(focal_payload.tweet, text)
+    if tail:
+        text = (text + "\n\n" + tail).strip()
+
     if not items and not extra_items:
         send_text(ctx, text, parse_mode=_parse_mode())
         status.finish()
@@ -554,18 +561,25 @@ def handle_tweet(
         items = payload.media_items()
         quote_items = quote.media_items() if quote is not None else []
         quote_caption = _quote_caption(quote.tweet) if quote is not None else None
+        # The source link rides at the very end, after ALL composition; the
+        # message that carried the link is deleted on success, so the delivery
+        # itself must keep the source reachable.
+        tail = source_link_tail(payload.tweet, text)
         log.info(
-            "Tweet %s: lang=%r translated=%r same_as_original=%r reply_has_translation=%r quote=%r",
+            "Tweet %s: lang=%r translated=%r same_as_original=%r reply_has_translation=%r quote=%r source_tail=%r",
             tweet_id,
             payload.tweet.get("lang"),
             (payload.tweet.get("translation") or {}).get("text", "")[:50],
             (payload.tweet.get("translation") or {}).get("text", "") == payload.tweet.get("text"),
             "ترجمه" in text,
             quote.tweet.get("id") if quote is not None else payload.quote_unavailable,
+            bool(tail),
         )
         if not items and not quote_items and not text:
             status.error("❌ محتوای این توییت خالی است.")
             return False
+        if tail:
+            text = (text + "\n\n" + tail).strip()
 
         status.update("📤 در حال ارسال به تلگرام...")
         deliver(ctx, items, text, extra_items=quote_items, extra_caption=quote_caption,

@@ -248,6 +248,33 @@ def build_quote_section(
     return "\n\n" + "\n".join(parts)
 
 
+def source_link_tail(tweet: dict[str, Any], text: str) -> str:
+    """The linked tweet's own URL as a delivery-level tail line.
+
+    DELETE_SOURCE_LINK removes the message that carried the link, so the
+    delivery itself must keep the source reachable. The handler appends this
+    AFTER all composition (body, quote card, oversized notes) — never inside
+    the body renderers, whose bytes are pinned by contract tests.
+
+    Returns "" when the payload has no url, or the url is already VISIBLE in
+    the text: tags are stripped first (a rich continuation anchor hides its
+    url behind a label, which is tappable but not copyable) and entities
+    unescaped. The plain layout's per-item 🔗 lines therefore dedupe, while a
+    hidden href never suppresses the visible tail.
+    """
+    url = (tweet.get("url") or "").strip() if isinstance(tweet, dict) else ""
+    if not url:
+        return ""
+    visible = html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+    if url in visible:
+        return ""
+    if _rich():
+        # HTML mode does not auto-link bare URLs: the visible URL text itself
+        # rides on the anchor, so it stays tappable AND copyable.
+        return f'🔗 <a href="{html.escape(url, quote=True)}">{esc(url)}</a>'
+    return f"🔗 {url}"
+
+
 PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
 THREAD_ITEM_SEPARATOR = "┄" * 20
 _UNAVAILABLE_LABELS = {
