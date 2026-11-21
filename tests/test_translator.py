@@ -44,7 +44,7 @@ class Translate(unittest.TestCase):
         with mock.patch.object(translator._session, "get", return_value=gtx_response("سلام ", "دنیا")) as get:
             self.assertEqual(translator.translate("hello world", "fa"), "سلام دنیا")
         self.assertEqual(get.call_args.kwargs["params"]["tl"], "fa")
-        self.assertEqual(get.call_args.kwargs["params"]["client"], "gtx")
+        self.assertEqual(get.call_args.kwargs["params"]["client"], "dict-chrome-ex")
 
     def test_long_text_is_sent_in_several_requests(self):
         text = "\n".join(["y" * 400] * 40)  # ~16k chars, far over the chunk limit

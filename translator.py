@@ -86,7 +86,9 @@ def translate(text: str, target: str, source: str = "auto") -> str | None:
             response = _session.get(
                 GOOGLE_TRANSLATE_URL,
                 params={
-                    "client": "gtx",
+                    # client=gtx gets HTTP 429 ("Sorry" abuse page) from datacenter
+                    # IPs incl. WARP; dict-chrome-ex is the same endpoint, still open.
+                    "client": "dict-chrome-ex",
                     "sl": source,
                     "tl": target,
                     "dt": "t",
