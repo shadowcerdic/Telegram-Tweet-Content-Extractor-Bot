@@ -183,6 +183,189 @@ def _diagnose_metadata_failure(context: Any, shortcode: str) -> str | None:
     return None
 
 
+# --- Ruling-payload fallback -------------------------------------------------
+# Since 2026-11-19 Instagram rate-limits the anonymous PolarisPostRootQuery
+# (GraphQL code 1675004 "Rate limit exceeded") for every post, while the ruling
+# query (_POLARIS_RULING_DOC_ID) still serves the full public payload — photos,
+# reels and carousels — logged out. When the primary metadata fetch fails with
+# BadResponseException, download media straight from that payload instead.
+
+_CT_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+}
+
+
+def _ruling_public_payload(context: Any, shortcode: str) -> dict | None:
+    """Return the public (ungated) Polaris payload, or None when unavailable."""
+    import instaloader
+
+    if getattr(context, "is_logged_in", False):
+        return None
+    if len(shortcode) > 11:
+        return None
+    try:
+        media_id = str(instaloader.Post.shortcode_to_mediaid(shortcode))
+        resp = context.doc_id_graphql_query(
+            _POLARIS_RULING_DOC_ID, {"media_id": media_id}, web_api=True
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort fallback only
+        log.debug("Ruling fallback query failed for %s: %s", shortcode, exc)
+        return None
+    data = resp.get("data") if isinstance(resp, dict) else None
+    polaris = data.get("xig_polaris_media") if isinstance(data, dict) else None
+    ung = polaris.get("if_not_gated_logged_out") if isinstance(polaris, dict) else None
+    return ung if isinstance(ung, dict) else None
+
+
+def _suffix_from_url(url: str) -> str | None:
+    path = url.split("?", 1)[0].lower()
+    for suffix in (".jpg", ".jpeg", ".png", ".webp", ".mp4"):
+        if path.endswith(suffix):
+            return ".jpg" if suffix == ".jpeg" else suffix
+    return None
+
+
+def _download_url(
+    context: Any, url: str, dest_base: Path, max_bytes: int
+) -> tuple[Path | None, bool]:
+    """Stream a CDN URL into ``dest_base.<ext>`` (extension from Content-Type).
+
+    Returns (path, oversized). Aborts and removes the partial file as soon as
+    the body exceeds ``max_bytes`` so an oversized reel never lands on disk.
+    """
+    import requests
+
+    session = getattr(context, "_session", None)
+    if session is None:
+        session = requests.Session()
+    try:
+        with session.get(url, stream=True, timeout=60) as resp:
+            if getattr(resp, "status_code", 0) != 200:
+                return None, False
+            headers = getattr(resp, "headers", {}) or {}
+            ct = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            suffix = _CT_SUFFIX.get(ct) or _suffix_from_url(url)
+            if suffix is None:
+                return None, False
+            dest = dest_base.with_suffix(suffix)
+            total = 0
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        fh.close()
+                        dest.unlink(missing_ok=True)
+                        return None, True
+                    fh.write(chunk)
+            if total == 0:
+                dest.unlink(missing_ok=True)
+                return None, False
+            return dest, False
+    except Exception as exc:  # noqa: BLE001 - network/IO error -> try next candidate
+        log.debug("Fallback download failed for %s: %s", url[:80], exc)
+        return None, False
+
+
+def _head_length(context: Any, url: str) -> int | None:
+    """Content-Length via HEAD, or None when the server does not reveal it."""
+    session = getattr(context, "_session", None)
+    if session is None:
+        return None
+    try:
+        resp = session.head(url, timeout=20, allow_redirects=True)
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        length = (getattr(resp, "headers", {}) or {}).get("Content-Length")
+        return int(length) if length else None
+    except Exception:  # noqa: BLE001 - size probe is best-effort
+        return None
+
+
+def _pick_video_url(context: Any, video_versions: list, max_bytes: int) -> str | None:
+    """Largest progressive variant that fits the cap; unknown sizes kept last."""
+    best_url, best_size = None, -1
+    unknown = None
+    for variant in video_versions or []:
+        url = (variant or {}).get("url")
+        if not url:
+            continue
+        size = _head_length(context, url)
+        if size is None:
+            if unknown is None:
+                unknown = url
+            continue
+        if size > max_bytes:
+            continue
+        if size > best_size:
+            best_url, best_size = url, size
+    return best_url or unknown
+
+
+def _download_photo(
+    context: Any, item: dict, dest_base: Path, max_bytes: int
+) -> tuple[Path | None, bool]:
+    """Best-first candidates; fall through to smaller ones on failure/oversize."""
+    candidates = ((item.get("image_versions2") or {}).get("candidates")) or []
+    oversized = False
+    for cand in candidates[:3]:
+        url = (cand or {}).get("url")
+        if not url:
+            continue
+        path, over = _download_url(context, url, dest_base, max_bytes)
+        if path is not None:
+            return path, False
+        oversized = oversized or over
+    return None, oversized
+
+
+def _download_from_polaris(
+    context: Any,
+    shortcode: str,
+    workdir: Path,
+    ung: dict,
+    max_bytes: int | None = None,
+) -> tuple[int, str, int]:
+    """Download media from the ruling payload into ``workdir``.
+
+    Returns (written, caption, oversized). Reads the upload cap at call time
+    so an operator .env change is honoured without a restart-time freeze.
+    """
+    import constants
+
+    cap = max_bytes if max_bytes is not None else constants.MAX_UPLOAD_BYTES
+    slides = ung.get("carousel_media") if ung.get("media_type") == 8 else None
+    items = slides if isinstance(slides, list) and slides else [ung]
+    workdir.mkdir(parents=True, exist_ok=True)
+    written = oversized = 0
+    for idx, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        base = workdir / (f"{shortcode}_{idx}" if len(items) > 1 else shortcode)
+        videos = item.get("video_versions") or []
+        if videos:
+            url = _pick_video_url(context, videos, cap)
+            if url is None:
+                oversized += 1
+                continue
+            path, over = _download_url(context, url, base, cap)
+        else:
+            path, over = _download_photo(context, item, base, cap)
+        if path is not None:
+            written += 1
+        elif over:
+            oversized += 1
+    caption = ung.get("caption")
+    if isinstance(caption, dict):
+        caption = caption.get("text") or ""
+    return written, (caption or "").strip(), oversized
+
+
 def _download(shortcode: str, workdir: Path) -> str | None:
     """Download a post into ``workdir`` and return its caption."""
     import instaloader
@@ -204,6 +387,28 @@ def _download(shortcode: str, workdir: Path) -> str | None:
         log.warning("Instagram rate limit hit for %s: %s", shortcode, exc)
         raise MediaFetchError("⏳ اینستاگرام موقتاً درخواست‌های ربات را محدود (Rate-limit) کرده است؛ کمی بعد دوباره تلاش کنید.") from exc
     except ex.BadResponseException as exc:
+        ung = _ruling_public_payload(loader.context, shortcode)
+        if ung is not None:
+            written, caption, oversized = _download_from_polaris(
+                loader.context, shortcode, workdir, ung
+            )
+            if written:
+                log.info(
+                    "Instagram %s: ruling fallback wrote %d item(s), oversized=%d",
+                    shortcode, written, oversized,
+                )
+                if oversized:
+                    note = f"⚠️ {oversized} فایل از این پست بزرگتر از سقف ۵۰ مگابایت تلگرام بود و ارسال نشد."
+                    caption = f"{caption}\n\n{note}".strip() if caption else note
+                return caption or None
+            if oversized:
+                raise MediaFetchError(
+                    "⚠️ حجم این مدیای اینستاگرام بیشتر از سقف ۵۰ مگابایت تلگرام است و مستقیماً قابل ارسال نیست."
+                ) from exc
+            log.warning("Instagram ruling fallback empty for %s", shortcode)
+            raise MediaFetchError(
+                "⏳ اینستاگرام موقتاً دانلود ناشناس این پست را محدود کرده است؛ کمی بعد دوباره تلاش کنید."
+            ) from exc
         specific = _diagnose_metadata_failure(loader.context, shortcode)
         if specific:
             log.info("Instagram gated/missing post %s: %s", shortcode, specific)

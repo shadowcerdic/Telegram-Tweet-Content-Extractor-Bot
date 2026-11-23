@@ -195,6 +195,208 @@ class InstagramFailureDiagnosis(unittest.TestCase):
         self.assertIn("محدودیت سنی", str(cm.exception))
 
 
+class InstagramRulingFallback(unittest.TestCase):
+    """Primary metadata query rate-limited (1675004) -> ruling-payload fallback."""
+
+    def _fake_loader(self, ung):
+        loader = mock.Mock()
+        loader.context.is_logged_in = False
+        loader.context.doc_id_graphql_query.return_value = {
+            "data": {"xig_polaris_media": {
+                "gating_ruling": None,
+                "if_not_gated_logged_out": ung,
+            }}
+        }
+        return loader
+
+    @staticmethod
+    def _photo_ung(caption="hello"):
+        return {
+            "media_type": 1,
+            "caption": {"text": caption},
+            "image_versions2": {"candidates": [
+                {"url": "https://cdn/x.jpg"},
+                {"url": "https://cdn/x_small.jpg"},
+            ]},
+        }
+
+    @staticmethod
+    def _write_jpg(ctx, url, base, cap):
+        p = base.with_suffix(".jpg")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"jpegbytes")
+        return p, False
+
+    def _run_download(self, loader, shortcode, workdir):
+        import instaloader
+        import instagram_client
+        with mock.patch.object(instagram_client, "_get_loader", return_value=loader), \
+             mock.patch.object(
+                 instaloader.Post, "from_shortcode",
+                 side_effect=instaloader.exceptions.BadResponseException(
+                     "Fetching Post metadata failed.")):
+            return instagram_client._download(shortcode, workdir)
+
+    def test_photo_fallback_delivers_caption_and_file(self):
+        import instagram_client
+        loader = self._fake_loader(self._photo_ung("caption text"))
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "w"
+            with mock.patch.object(instagram_client, "_download_url",
+                                   side_effect=self._write_jpg):
+                caption = self._run_download(loader, "DfhzAHdomFE", workdir)
+            self.assertEqual(caption, "caption text")
+            self.assertTrue((workdir / "DfhzAHdomFE.jpg").exists())
+
+    def test_reel_fallback_picks_largest_variant_under_cap(self):
+        import instagram_client
+        ung = {
+            "media_type": 2,
+            "caption": {"text": "reel"},
+            "video_versions": [
+                {"url": "https://cdn/v1.mp4"},
+                {"url": "https://cdn/v2.mp4"},
+            ],
+        }
+        loader = self._fake_loader(ung)
+        sizes = {"https://cdn/v1.mp4": 100, "https://cdn/v2.mp4": 500}
+
+        def fake_mp4(ctx, url, base, cap):
+            p = base.with_suffix(".mp4")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"mp4bytes")
+            return p, False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "w"
+            with mock.patch.object(instagram_client, "_head_length",
+                                   side_effect=lambda ctx, url: sizes.get(url)), \
+                 mock.patch.object(instagram_client, "_download_url",
+                                   side_effect=fake_mp4) as dl:
+                caption = self._run_download(loader, "De-MryvTVWC", workdir)
+            self.assertEqual(caption, "reel")
+            self.assertEqual(dl.call_args[0][1], "https://cdn/v2.mp4")
+            self.assertTrue((workdir / "De-MryvTVWC.mp4").exists())
+
+    def test_carousel_fallback_writes_every_slide_in_order(self):
+        import instagram_client
+        slide = self._photo_ung()
+        ung = {"media_type": 8, "caption": {"text": "album"},
+               "carousel_media": [slide, dict(slide)]}
+        loader = self._fake_loader(ung)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "w"
+            with mock.patch.object(instagram_client, "_download_url",
+                                   side_effect=self._write_jpg):
+                caption = self._run_download(loader, "Dfa_KJyl2Uw", workdir)
+            self.assertEqual(caption, "album")
+            self.assertTrue((workdir / "Dfa_KJyl2Uw_1.jpg").exists())
+            self.assertTrue((workdir / "Dfa_KJyl2Uw_2.jpg").exists())
+
+    def test_all_oversized_raises_50mb_message(self):
+        import instagram_client
+        loader = self._fake_loader(self._photo_ung())
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "w"
+            with mock.patch.object(instagram_client, "_download_url",
+                                   return_value=(None, True)):
+                with self.assertRaises(instagram_client.MediaFetchError) as cm:
+                    self._run_download(loader, "DfhzAHdomFE", workdir)
+        self.assertIn("۵۰ مگابایت", str(cm.exception))
+
+    def test_partial_oversized_appends_note_to_caption(self):
+        import instagram_client
+        photo = self._photo_ung()
+        big_video = {"media_type": 2,
+                     "video_versions": [{"url": "https://cdn/big.mp4"}]}
+        ung = {"media_type": 8, "caption": {"text": "mixed"},
+               "carousel_media": [photo, big_video]}
+        loader = self._fake_loader(ung)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "w"
+            with mock.patch.object(instagram_client, "_head_length",
+                                   return_value=10 ** 9), \
+                 mock.patch.object(instagram_client, "_download_url",
+                                   side_effect=self._write_jpg):
+                caption = self._run_download(loader, "Dfa_KJyl2Uw", workdir)
+        self.assertIn("mixed", caption)
+        self.assertIn("1 فایل", caption)
+        self.assertIn("۵۰ مگابایت", caption)
+
+    def test_public_payload_without_media_gets_rate_limit_message(self):
+        import instagram_client
+        loader = self._fake_loader({"media_type": 1})
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(instagram_client.MediaFetchError) as cm:
+                self._run_download(loader, "DfhzAHdomFE", Path(tmp) / "w")
+        self.assertIn("موقتاً", str(cm.exception))
+
+    def test_primary_success_never_calls_ruling_query(self):
+        import instaloader
+        import instagram_client
+        loader = mock.Mock()
+        loader.context.is_logged_in = False
+        post = mock.Mock()
+        post.caption = "ok"
+        with mock.patch.object(instagram_client, "_get_loader", return_value=loader), \
+             mock.patch.object(instaloader.Post, "from_shortcode", return_value=post):
+            caption = instagram_client._download("DfzVRIHoHS4", Path("/tmp/unused"))
+        self.assertEqual(caption, "ok")
+        loader.context.doc_id_graphql_query.assert_not_called()
+
+    def test_download_url_uses_content_type_and_enforces_cap(self):
+        import instagram_client
+        ctx = mock.MagicMock()
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {"Content-Type": "image/jpeg"}
+        resp.iter_content.return_value = [b"a" * 60, b"b" * 60]
+        ctx._session.get.return_value.__enter__.return_value = resp
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "CODE"
+            path, over = instagram_client._download_url(ctx, "https://cdn/x", base, 100)
+            self.assertIsNone(path)
+            self.assertTrue(over)
+            self.assertFalse(base.with_suffix(".jpg").exists())
+            resp.iter_content.return_value = [b"a" * 60]
+            path, over = instagram_client._download_url(ctx, "https://cdn/x", base, 100)
+            assert path is not None
+            self.assertFalse(over)
+            self.assertEqual(path.suffix, ".jpg")
+            self.assertEqual(path.read_bytes(), b"a" * 60)
+
+    def test_download_url_webp_kept_for_later_conversion(self):
+        import instagram_client
+        ctx = mock.MagicMock()
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {"Content-Type": "image/webp"}
+        resp.iter_content.return_value = [b"riff"]
+        ctx._session.get.return_value.__enter__.return_value = resp
+        with tempfile.TemporaryDirectory() as tmp:
+            path, over = instagram_client._download_url(
+                ctx, "https://cdn/x", Path(tmp) / "CODE", 100)
+            assert path is not None
+            self.assertEqual(path.suffix, ".webp")
+            self.assertFalse(over)
+
+    def test_pick_video_url_all_over_cap_returns_none(self):
+        import instagram_client
+        ctx = mock.Mock()
+        with mock.patch.object(instagram_client, "_head_length", return_value=10 ** 9):
+            url = instagram_client._pick_video_url(
+                ctx, [{"url": "https://cdn/a.mp4"}, {"url": "https://cdn/b.mp4"}], 100)
+        self.assertIsNone(url)
+
+    def test_pick_video_url_unknown_size_falls_back_to_first(self):
+        import instagram_client
+        ctx = mock.Mock()
+        with mock.patch.object(instagram_client, "_head_length", return_value=None):
+            url = instagram_client._pick_video_url(
+                ctx, [{"url": "https://cdn/a.mp4"}, {"url": "https://cdn/b.mp4"}], 100)
+        self.assertEqual(url, "https://cdn/a.mp4")
+
+
 def resp(status=200, payload=None):
     r = mock.Mock()
     r.status_code = status
